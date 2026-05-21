@@ -24,6 +24,9 @@ env/
 # Environment secrets
 .env
 
+# Claude Code local settings
+.claude/
+
 # Tool caches
 .ruff_cache/
 .pyright/
