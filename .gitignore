@@ -1,0 +1,38 @@
+# Anchor local state — never commit
+.anchor/
+oauth_token.json
+*_token.json
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment secrets
+.env
+
+# Tool caches
+.ruff_cache/
+.pyright/
+.mypy_cache/
+.pytest_cache/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
