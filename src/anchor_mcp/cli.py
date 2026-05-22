@@ -167,3 +167,53 @@ def auth_status() -> None:
             "Not authenticated. Run `anchor auth login --credentials <path>`."
         )
         raise SystemExit(1)
+
+
+# ── sync ──────────────────────────────────────────────────────────────────────
+
+@cli.command()
+def sync() -> None:
+    """Sync the configured Google Drive folder into the vector store."""
+    from anchor_mcp.auth import load_credentials
+    from anchor_mcp.backends import get_backend
+    from anchor_mcp.drive import DriveClient
+    from anchor_mcp.embed import Embedder
+    from anchor_mcp.sync import Syncer, SyncState
+
+    try:
+        cfg = load_config()
+    except ConfigNotFoundError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        creds = load_credentials()
+    except AuthError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    state_path = cfg.state_dir / "cache" / "sync_state.json"
+    state = SyncState.load(state_path)
+
+    syncer = Syncer(
+        drive=DriveClient(creds),
+        embedder=Embedder(cfg.embedding_model),
+        backend=get_backend(cfg),
+        state=state,
+        state_path=state_path,
+        chunk_size=cfg.chunk_size,
+        chunk_overlap=cfg.chunk_overlap,
+    )
+
+    def _progress(msg: str) -> None:
+        click.echo(f"  {msg}")
+
+    click.echo("Syncing…")
+    report = syncer.sync(cfg.drive_folder_id, progress_cb=_progress)
+
+    click.echo(
+        f"\nDone — added {report.added}, updated {report.updated}, "
+        f"deleted {report.deleted}, skipped {report.skipped}."
+    )
+    if report.errors:
+        click.echo(f"{len(report.errors)} error(s):", err=True)
+        for err in report.errors:
+            click.echo(f"  {err}", err=True)
