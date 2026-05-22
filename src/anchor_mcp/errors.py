@@ -16,3 +16,11 @@ class SyncError(AnchorError):
 
 class BackendError(AnchorError):
     """Raised on vector backend failures."""
+
+
+class ExtractError(AnchorError):
+    """Raised when text cannot be extracted from a file (e.g. scanned PDF)."""
+
+
+class UnsupportedMimeTypeError(AnchorError):
+    """Raised when a file's MIME type is not supported for extraction."""
