@@ -221,6 +221,43 @@ def sync() -> None:
 @cli.command()
 def serve() -> None:
     """Start the Anchor MCP server (stdio transport)."""
+    import io
+    import os
+    import sys
+    from typing import Any
+
+    # MCP stdio transport requires stdout to carry only JSON-RPC frames.
+    # Any library that prints to stdout corrupts the protocol — suppress what we can.
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
+    # Replace sys.stdout so text writes (print, library logs) divert to stderr,
+    # but expose the original byte buffer on `.buffer` for MCP's binary protocol.
+    _real_stdout_buffer = sys.stdout.buffer
+
+    _stderr_encoding: str = sys.stderr.encoding or "utf-8"
+
+    class _StdoutToStderr(io.TextIOBase):
+        encoding: str = _stderr_encoding
+
+        @property
+        def buffer(self) -> Any:
+            return _real_stdout_buffer
+
+        def write(self, s: str) -> int:
+            return sys.stderr.write(s)
+
+        def flush(self) -> None:
+            sys.stderr.flush()
+
+        def isatty(self) -> bool:
+            return False
+
+    sys.stdout = _StdoutToStderr()
+
     from anchor_mcp.server import mcp
 
     mcp.run(transport="stdio")
