@@ -195,7 +195,7 @@ def sync() -> None:
 
     syncer = Syncer(
         drive=DriveClient(creds),
-        embedder=Embedder(cfg.embedding_model),
+        embedder=Embedder(cfg.embedding_model, device=cfg.device, show_progress=True),
         backend=get_backend(cfg),
         state=state,
         state_path=state_path,
@@ -203,11 +203,8 @@ def sync() -> None:
         chunk_overlap=cfg.chunk_overlap,
     )
 
-    def _progress(msg: str) -> None:
-        click.echo(f"  {msg}")
-
     click.echo("Syncing…")
-    report = syncer.sync(cfg.drive_folder_id, progress_cb=_progress)
+    report = syncer.sync(cfg.drive_folder_id, show_progress=True)
 
     click.echo(
         f"\nDone — added {report.added}, updated {report.updated}, "

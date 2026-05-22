@@ -3,6 +3,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import BaseModel, Field
+from tqdm.auto import tqdm
 
 from anchor_mcp.backends.base import VectorBackend
 from anchor_mcp.chunk import chunk_text
@@ -65,12 +66,23 @@ class Syncer:
         self,
         folder_id: str,
         progress_cb: Callable[[str], None] | None = None,
+        show_progress: bool = False,
     ) -> SyncReport:
         report = SyncReport()
         drive_files = self._drive.list_files(folder_id)
         drive_ids = {f.id for f in drive_files}
 
-        for file in drive_files:
+        pbar = tqdm(
+            drive_files,
+            desc="Files",
+            unit="file",
+            disable=not show_progress,
+            dynamic_ncols=True,
+        )
+
+        for file in pbar:
+            if show_progress:
+                pbar.set_postfix_str(file.name[:50])
             try:
                 if file.id not in self._state.files:
                     self._add_file(file, progress_cb)

@@ -9,15 +9,25 @@ _BATCH_SIZE = 32
 class Embedder:
     """Wraps bge-m3 via sentence-transformers. Model is lazy-loaded on first use."""
 
-    def __init__(self, model_name: str = "BAAI/bge-m3") -> None:
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-m3",
+        device: str = "auto",
+        show_progress: bool = False,
+    ) -> None:
         self._model_name = model_name
+        self._device: str | None = None if device == "auto" else device
+        self._show_progress = show_progress
         self._model: Any = None
 
     def _get_model(self) -> Any:
         if self._model is None:
             from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]
 
-            self._model = SentenceTransformer(self._model_name)
+            kwargs: dict[str, Any] = {}
+            if self._device is not None:
+                kwargs["device"] = self._device
+            self._model = SentenceTransformer(self._model_name, **kwargs)
         return self._model
 
     def embed_chunks(self, chunks: list[Chunk]) -> list[list[float]]:
@@ -28,7 +38,7 @@ class Embedder:
             [c.text for c in chunks],
             batch_size=_BATCH_SIZE,
             normalize_embeddings=True,
-            show_progress_bar=False,
+            show_progress_bar=self._show_progress,
         ).tolist()
         return result
 

@@ -57,7 +57,7 @@ def _ensure_initialized() -> tuple[AnchorConfig, Embedder, VectorBackend]:
 
     embedder = _embedder
     if embedder is None:
-        embedder = Embedder(config.embedding_model)
+        embedder = Embedder(config.embedding_model, device=config.device)
         _embedder = embedder
 
     backend = _backend

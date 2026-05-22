@@ -23,6 +23,9 @@ class AnchorConfig(BaseModel):
     chunk_size: int = 800
     chunk_overlap: int = 100
     state_dir: Path = Field(default_factory=get_state_dir)
+    # "auto" lets sentence-transformers pick (uses CUDA if available, else CPU).
+    # Override with "cpu", "cuda", "cuda:0", "mps", etc.
+    device: str = "auto"
 
 
 def load_config(state_dir: Path | None = None) -> AnchorConfig:
