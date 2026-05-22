@@ -6,5 +6,6 @@
   "venv": ".venv",
   "reportMissingTypeStubs": "none",
   "reportUnknownMemberType": "none",
-  "reportUnknownVariableType": "none"
+  "reportUnknownVariableType": "none",
+  "reportUnknownArgumentType": "none"
 }
