@@ -1,10 +1,11 @@
+from pathlib import Path
 from typing import Literal, cast
 
 import click
 
 from anchor_mcp import secrets
 from anchor_mcp.config import AnchorConfig, get_state_dir, load_config, save_config
-from anchor_mcp.errors import ConfigNotFoundError
+from anchor_mcp.errors import AuthError, ConfigNotFoundError
 
 
 @click.group()
@@ -126,3 +127,43 @@ def doctor() -> None:
 def _report(ok: bool, label: str, detail: str) -> None:
     icon = "✓" if ok else "✗"
     click.echo(f"  {icon} {label}: {detail}")
+
+
+# ── auth ──────────────────────────────────────────────────────────────────────
+
+@cli.group("auth")
+def auth_group() -> None:
+    """Manage Google Drive authentication."""
+
+
+@auth_group.command("login")
+@click.option(
+    "--credentials",
+    "credentials_path",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Path to OAuth 2.0 Desktop client credentials JSON from Google Cloud Console.",
+)
+def auth_login(credentials_path: Path) -> None:
+    """Run the OAuth consent flow and save the encrypted token."""
+    from anchor_mcp.auth import run_oauth_flow
+
+    try:
+        run_oauth_flow(credentials_path)
+        click.echo("Authentication successful.")
+    except AuthError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@auth_group.command("status")
+def auth_status() -> None:
+    """Report whether a valid OAuth token is present."""
+    from anchor_mcp.auth import is_authenticated
+
+    if is_authenticated():
+        click.echo("Authenticated.")
+    else:
+        click.echo(
+            "Not authenticated. Run `anchor auth login --credentials <path>`."
+        )
+        raise SystemExit(1)
