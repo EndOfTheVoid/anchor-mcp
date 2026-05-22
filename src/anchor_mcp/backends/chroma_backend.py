@@ -118,3 +118,31 @@ class ChromaBackend:
 
     def count(self) -> int:
         return self._col.count()
+
+    def get_chunks_by_file(self, file_id: str) -> list[Chunk]:
+        raw = self._col.get(  # type: ignore[call-arg]
+            where={"file_id": {"$eq": file_id}},
+            include=["documents", "metadatas"],
+        )
+        ids: list[str] = raw.get("ids") or []  # type: ignore[attr-defined]
+        docs: list[Any] = raw.get("documents") or []  # type: ignore[attr-defined]
+        metas: list[Any] = raw.get("metadatas") or []  # type: ignore[attr-defined]
+
+        chunks: list[Chunk] = []
+        for chunk_id, doc, meta in zip(ids, docs, metas, strict=True):
+            if meta is None:
+                continue
+            chunks.append(
+                Chunk(
+                    id=chunk_id,
+                    text=doc,
+                    file_id=str(meta["file_id"]),
+                    file_name=str(meta["file_name"]),
+                    chunk_index=int(meta["chunk_index"]),
+                    token_count=int(meta["token_count"]),
+                    modified_time=str(meta["modified_time"]),
+                    source_url=str(meta["source_url"]) or None,
+                )
+            )
+        chunks.sort(key=lambda c: c.chunk_index)
+        return chunks

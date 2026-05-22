@@ -127,3 +127,32 @@ class PineconeBackend:
     def count(self) -> int:
         stats: Any = self._index.describe_index_stats()
         return int(stats.total_vector_count)
+
+    def get_chunks_by_file(self, file_id: str) -> list[Chunk]:
+        import math
+
+        dim = EMBEDDING_DIM
+        neutral = [1.0 / math.sqrt(dim)] * dim
+        response: Any = self._index.query(
+            vector=neutral,
+            top_k=1000,
+            filter={"file_id": {"$eq": file_id}},
+            include_metadata=True,
+        )
+        chunks: list[Chunk] = []
+        for match in response.matches:
+            meta: dict[str, Any] = match.metadata or {}
+            chunks.append(
+                Chunk(
+                    id=match.id,
+                    text=str(meta.get("text", "")),
+                    file_id=str(meta.get("file_id", "")),
+                    file_name=str(meta.get("file_name", "")),
+                    chunk_index=int(meta.get("chunk_index", 0)),
+                    token_count=int(meta.get("token_count", 0)),
+                    modified_time=str(meta.get("modified_time", "")),
+                    source_url=str(meta.get("source_url")) or None,
+                )
+            )
+        chunks.sort(key=lambda c: c.chunk_index)
+        return chunks

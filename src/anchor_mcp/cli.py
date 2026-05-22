@@ -217,3 +217,13 @@ def sync() -> None:
         click.echo(f"{len(report.errors)} error(s):", err=True)
         for err in report.errors:
             click.echo(f"  {err}", err=True)
+
+
+# ── serve ─────────────────────────────────────────────────────────────────────
+
+@cli.command()
+def serve() -> None:
+    """Start the Anchor MCP server (stdio transport)."""
+    from anchor_mcp.server import mcp
+
+    mcp.run(transport="stdio")
