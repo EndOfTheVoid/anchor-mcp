@@ -1,31 +1,39 @@
-import math
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 import anchor_mcp.server as srv
-from anchor_mcp.backends.base import SourceInfo
-from anchor_mcp.backends.chroma_backend import ChromaBackend
+from anchor_mcp.backends.base import QueryResult
 from anchor_mcp.chunk import Chunk
 from anchor_mcp.config import AnchorConfig
-from anchor_mcp.embed import Embedder
-from anchor_mcp.server import DocumentView, SearchResult
+from anchor_mcp.embed import HybridEmbedding, SparseValues
+from anchor_mcp.server import DocumentView, SearchResult, SourceInfo
+from anchor_mcp.state_store import LocalStateStore
+from anchor_mcp.sync import FileRegistry, RegistryEntry
 
-# ── fixtures ──────────────────────────────────────────────────────────────────
-
-def _unit_vec(seed: float, dim: int = 4) -> list[float]:
-    vec = [seed + i for i in range(dim)]
-    norm = math.sqrt(sum(x * x for x in vec))
-    return [x / norm for x in vec]
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 
-def _chunk(chunk_id: str, file_id: str = "f1", idx: int = 0, text: str = "chunk text") -> Chunk:
+def _hybrid() -> HybridEmbedding:
+    return HybridEmbedding(
+        dense=[0.1] * 1024,
+        sparse=SparseValues(indices=[1, 2], values=[0.5, 0.3]),
+    )
+
+
+def _chunk(
+    chunk_id: str = "c1",
+    file_id: str = "f1",
+    file_name: str = "doc.txt",
+    idx: int = 0,
+    text: str = "chunk text",
+) -> Chunk:
     return Chunk(
         id=chunk_id,
         text=text,
         file_id=file_id,
-        file_name="doc.txt",
+        file_name=file_name,
         chunk_index=idx,
         token_count=2,
         modified_time="2024-01-01T00:00:00.000Z",
@@ -33,106 +41,128 @@ def _chunk(chunk_id: str, file_id: str = "f1", idx: int = 0, text: str = "chunk 
     )
 
 
+def _query_result(chunk_id: str = "c1", score: float = 0.9, **kw: object) -> QueryResult:
+    return QueryResult(chunk=_chunk(chunk_id, **kw), score=score)  # type: ignore[arg-type]
+
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+
 @pytest.fixture(autouse=True)
 def reset_server_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reset module-level singletons between tests."""
     monkeypatch.setattr(srv, "_config", None)
     monkeypatch.setattr(srv, "_embedder", None)
     monkeypatch.setattr(srv, "_backend", None)
+    monkeypatch.setattr(srv, "_state_store", None)
 
 
 @pytest.fixture()
-def injected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[AnchorConfig, MagicMock, ChromaBackend]:
+def injected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore]:
     config = AnchorConfig(drive_folder_id="folder1", state_dir=tmp_path)
-    mock_embedder = MagicMock(spec=Embedder)
-    mock_embedder.embed_query.return_value = _unit_vec(1.0)
-    backend = ChromaBackend(tmp_path)
+
+    mock_embedder = MagicMock()
+    mock_embedder.embed_query.return_value = _hybrid()
+
+    mock_backend = MagicMock()
+    mock_backend.query.return_value = []
+    mock_backend.get_chunks_by_file.return_value = []
+    mock_backend.count.return_value = 0
+
+    store = LocalStateStore(tmp_path / "cache")
 
     monkeypatch.setattr(srv, "_config", config)
     monkeypatch.setattr(srv, "_embedder", mock_embedder)
-    monkeypatch.setattr(srv, "_backend", backend)
+    monkeypatch.setattr(srv, "_backend", mock_backend)
+    monkeypatch.setattr(srv, "_state_store", store)
 
-    return config, mock_embedder, backend
+    return config, mock_embedder, mock_backend, store
 
 
 # ── search ────────────────────────────────────────────────────────────────────
 
-def test_search_returns_search_results(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+
+def test_search_calls_embedder_and_backend(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
-    _, mock_embedder, backend = injected
-    emb = _unit_vec(1.0)
-    backend.upsert([_chunk("c1"), _chunk("c2", file_id="f2")], [emb, _unit_vec(2.0)])
+    config, mock_embedder, mock_backend, _ = injected
+    mock_backend.query.return_value = [_query_result()]
 
-    results = srv.search("my query", top_k=2)
+    results = srv.search("my query", top_k=1)
 
-    assert isinstance(results, list)
-    assert all(isinstance(r, SearchResult) for r in results)
-    assert len(results) <= 2
     mock_embedder.embed_query.assert_called_once_with("my query")
+    mock_backend.query.assert_called_once()
+    assert len(results) == 1
+    assert isinstance(results[0], SearchResult)
 
 
-def test_search_top_k_limits_results(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+def test_search_uses_config_alpha_by_default(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
-    _, _, backend = injected
-    for i in range(5):
-        backend.upsert([_chunk(f"c{i}")], [_unit_vec(float(i))])
+    config, _, mock_backend, _ = injected
+    mock_backend.query.return_value = []
+    config.search_alpha = 0.5
 
-    results = srv.search("query", top_k=2)
-    assert len(results) == 2
+    srv.search("query")
+
+    call_kwargs = mock_backend.query.call_args.kwargs
+    assert call_kwargs["alpha"] == 0.5
 
 
-def test_search_empty_backend_returns_empty(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+def test_search_alpha_param_overrides_config(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
-    results = srv.search("query")
-    assert results == []
+    _, _, mock_backend, _ = injected
+    mock_backend.query.return_value = []
+
+    srv.search("query", alpha=0.2)
+
+    call_kwargs = mock_backend.query.call_args.kwargs
+    assert call_kwargs["alpha"] == 0.2
 
 
-def test_search_result_fields(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+def test_search_result_has_chunk_id(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
-    _, _, backend = injected
-    backend.upsert([_chunk("c1", text="interesting content")], [_unit_vec(1.0)])
+    _, _, mock_backend, _ = injected
+    mock_backend.query.return_value = [_query_result(chunk_id="chunk-abc")]
 
     results = srv.search("query", top_k=1)
-    r = results[0]
-
-    assert r.file_id == "f1"
-    assert r.file_name == "doc.txt"
-    assert r.chunk_index == 0
-    assert isinstance(r.relevance_score, float)
-    assert r.source_url is not None
+    assert results[0].chunk_id == "chunk-abc"
 
 
-def test_search_file_name_filter(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+def test_search_forwards_file_name_filter(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
-    _, _, backend = injected
-    c1 = Chunk(id="c1", text="t", file_id="f1", file_name="report.txt",
-               chunk_index=0, token_count=1, modified_time="2024-01-01T00:00:00.000Z",
-               source_url=None)
-    c2 = Chunk(id="c2", text="t", file_id="f2", file_name="notes.txt",
-               chunk_index=0, token_count=1, modified_time="2024-01-01T00:00:00.000Z",
-               source_url=None)
-    backend.upsert([c1, c2], [_unit_vec(1.0), _unit_vec(2.0)])
+    _, _, mock_backend, _ = injected
+    mock_backend.query.return_value = []
 
-    results = srv.search("query", top_k=5, file_name_filter="report.txt")
-    assert all(r.file_name == "report.txt" for r in results)
+    srv.search("query", file_name_filter="report.pdf")
+
+    call_kwargs = mock_backend.query.call_args.kwargs
+    assert call_kwargs["file_name_filter"] == "report.pdf"
+
+
+def test_search_empty_returns_empty_list(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
+) -> None:
+    _, _, mock_backend, _ = injected
+    mock_backend.query.return_value = []
+    assert srv.search("query") == []
 
 
 # ── get_document ──────────────────────────────────────────────────────────────
 
-def test_get_document_returns_document_view(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+
+def test_get_document_concatenates_chunks(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
-    _, _, backend = injected
-    chunks = [
+    _, _, mock_backend, _ = injected
+    mock_backend.get_chunks_by_file.return_value = [
         _chunk("c1", idx=0, text="First chunk."),
         _chunk("c2", idx=1, text="Second chunk."),
     ]
-    backend.upsert(chunks, [_unit_vec(1.0), _unit_vec(2.0)])
 
     doc = srv.get_document("f1")
 
@@ -143,78 +173,65 @@ def test_get_document_returns_document_view(
     assert "Second chunk." in doc.text
 
 
-def test_get_document_chunks_in_order(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
-) -> None:
-    _, _, backend = injected
-    # Insert in reverse order to verify sort
-    chunks = [_chunk("c2", idx=1, text="B"), _chunk("c1", idx=0, text="A")]
-    backend.upsert(chunks, [_unit_vec(1.0), _unit_vec(2.0)])
-
-    doc = srv.get_document("f1")
-    assert doc.text.index("A") < doc.text.index("B")
-
-
-def test_get_document_missing_file_raises(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+def test_get_document_missing_raises(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
     from anchor_mcp.errors import BackendError
 
+    _, _, mock_backend, _ = injected
+    mock_backend.get_chunks_by_file.return_value = []
+
     with pytest.raises(BackendError):
-        srv.get_document("nonexistent_file_id")
+        srv.get_document("nonexistent")
 
 
 # ── list_sources ──────────────────────────────────────────────────────────────
 
-def test_list_sources_returns_source_infos(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+
+def _write_registry(store: LocalStateStore, entries: dict[str, RegistryEntry]) -> None:
+    registry = FileRegistry(files=entries)
+    registry.save(store)
+
+
+def test_list_sources_returns_from_registry(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
-    _, _, backend = injected
-    c1 = Chunk(id="a1", text="t", file_id="f1", file_name="report.txt",
-               chunk_index=0, token_count=1, modified_time="2024-01-01T00:00:00.000Z",
-               source_url=None)
-    c2 = Chunk(id="b1", text="t", file_id="f2", file_name="notes.txt",
-               chunk_index=0, token_count=1, modified_time="2024-01-01T00:00:00.000Z",
-               source_url=None)
-    backend.upsert([c1, c2], [_unit_vec(1.0), _unit_vec(2.0)])
+    _, _, _, store = injected
+    _write_registry(
+        store,
+        {
+            "f1": RegistryEntry(file_name="report.pdf", chunk_count=3, modified_time="2024-01"),
+            "f2": RegistryEntry(file_name="notes.txt", chunk_count=1, modified_time="2024-02"),
+        },
+    )
 
     sources = srv.list_sources()
-
-    assert isinstance(sources, list)
-    assert all(isinstance(s, SourceInfo) for s in sources)
     assert len(sources) == 2
+    assert all(isinstance(s, SourceInfo) for s in sources)
 
 
 def test_list_sources_name_filter(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
-    _, _, backend = injected
-    c1 = Chunk(id="a1", text="t", file_id="f1", file_name="ISB_Strategy.pdf",
-               chunk_index=0, token_count=1, modified_time="2024-01-01T00:00:00.000Z",
-               source_url=None)
-    c2 = Chunk(id="b1", text="t", file_id="f2", file_name="random_notes.txt",
-               chunk_index=0, token_count=1, modified_time="2024-01-01T00:00:00.000Z",
-               source_url=None)
-    backend.upsert([c1, c2], [_unit_vec(1.0), _unit_vec(2.0)])
+    _, _, _, store = injected
+    _write_registry(
+        store,
+        {
+            "f1": RegistryEntry(
+                file_name="ISB_Strategy.pdf", chunk_count=2, modified_time="2024-01"
+            ),
+            "f2": RegistryEntry(
+                file_name="random_notes.txt", chunk_count=1, modified_time="2024-01"
+            ),
+        },
+    )
 
     results = srv.list_sources(name_filter="ISB")
     assert len(results) == 1
     assert results[0].file_name == "ISB_Strategy.pdf"
 
 
-def test_list_sources_empty(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
+def test_list_sources_empty_registry(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
     assert srv.list_sources() == []
-
-
-# ── lazy initialization ───────────────────────────────────────────────────────
-
-def test_ensure_initialized_uses_injected_values(
-    injected: tuple[AnchorConfig, MagicMock, ChromaBackend],
-) -> None:
-    config, embedder, backend = injected
-    c, e, b = srv._ensure_initialized()
-    assert c is config
-    assert e is embedder
-    assert b is backend

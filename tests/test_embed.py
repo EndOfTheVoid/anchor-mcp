@@ -1,10 +1,7 @@
-import math
-from unittest.mock import MagicMock, patch
-
-import numpy as np
+from unittest.mock import MagicMock
 
 from anchor_mcp.chunk import Chunk
-from anchor_mcp.embed import Embedder
+from anchor_mcp.embed import HybridEmbedding, PineconeEmbedder, SparseValues
 
 
 def _chunk(i: int) -> Chunk:
@@ -20,61 +17,93 @@ def _chunk(i: int) -> Chunk:
     )
 
 
-def _mock_model(n: int, dim: int = 1024) -> MagicMock:
-    model = MagicMock()
-    arr = np.random.randn(n, dim).astype("float32")
-    arr /= np.linalg.norm(arr, axis=1, keepdims=True)
-    model.encode.return_value = arr
-    return model
+def _make_dense_response(n: int, dim: int = 1024) -> list[MagicMock]:
+    results = []
+    for _ in range(n):
+        m = MagicMock()
+        m.values = [0.1] * dim
+        results.append(m)
+    return results
+
+
+def _make_sparse_response(n: int) -> list[MagicMock]:
+    results = []
+    for _ in range(n):
+        m = MagicMock()
+        sv = MagicMock()
+        sv.indices = [1, 2]
+        sv.values = [0.5, 0.3]
+        m.sparse_values = sv
+        results.append(m)
+    return results
+
+
+def _make_pc(n_chunks: int) -> MagicMock:
+    pc = MagicMock()
+    pc.inference.embed.side_effect = [
+        _make_dense_response(n_chunks),
+        _make_sparse_response(n_chunks),
+    ]
+    return pc
+
+
+def test_embed_query_returns_hybrid_embedding() -> None:
+    pc = _make_pc(1)
+    embedder = PineconeEmbedder(pc, "dense-model", "sparse-model")
+    result = embedder.embed_query("test query")
+
+    assert isinstance(result, HybridEmbedding)
+    assert len(result.dense) == 1024
+    assert isinstance(result.sparse, SparseValues)
+    assert result.sparse.indices == [1, 2]
+    assert result.sparse.values == [0.5, 0.3]
+
+
+def test_embed_query_uses_query_input_type() -> None:
+    pc = _make_pc(1)
+    embedder = PineconeEmbedder(pc, "dense-model", "sparse-model")
+    embedder.embed_query("hello")
+
+    first_call = pc.inference.embed.call_args_list[0]
+    params = first_call.kwargs.get("parameters") or first_call.args[2]
+    assert params["input_type"] == "query"
+
+
+def test_embed_chunks_uses_passage_input_type() -> None:
+    pc = _make_pc(1)
+    embedder = PineconeEmbedder(pc, "dense-model", "sparse-model")
+    embedder.embed_chunks([_chunk(0)])
+
+    first_call = pc.inference.embed.call_args_list[0]
+    params = first_call.kwargs.get("parameters") or first_call.args[2]
+    assert params["input_type"] == "passage"
 
 
 def test_embed_chunks_returns_correct_count() -> None:
-    mock_model = _mock_model(3)
-    with patch("sentence_transformers.SentenceTransformer", return_value=mock_model):
-        embedder = Embedder()
-        result = embedder.embed_chunks([_chunk(i) for i in range(3)])
-    assert len(result) == 3
-
-
-def test_embed_chunks_returns_correct_dim() -> None:
-    mock_model = _mock_model(2)
-    with patch("sentence_transformers.SentenceTransformer", return_value=mock_model):
-        embedder = Embedder()
-        result = embedder.embed_chunks([_chunk(0), _chunk(1)])
-    assert len(result[0]) == 1024
+    pc = _make_pc(3)
+    embedder = PineconeEmbedder(pc, "dense-model", "sparse-model")
+    results = embedder.embed_chunks([_chunk(i) for i in range(3)])
+    assert len(results) == 3
 
 
 def test_embed_chunks_empty_returns_empty() -> None:
-    embedder = Embedder()
+    pc = MagicMock()
+    embedder = PineconeEmbedder(pc, "dense-model", "sparse-model")
     assert embedder.embed_chunks([]) == []
+    pc.inference.embed.assert_not_called()
 
 
-def test_embed_chunks_calls_normalize() -> None:
-    mock_model = _mock_model(1)
-    with patch("sentence_transformers.SentenceTransformer", return_value=mock_model):
-        embedder = Embedder()
-        embedder.embed_chunks([_chunk(0)])
-    _, kwargs = mock_model.encode.call_args
-    assert kwargs.get("normalize_embeddings") is True
+def test_embed_chunks_batches_at_96() -> None:
+    pc = MagicMock()
+    # 100 chunks → 2 batches: 96 + 4 → 4 total inference calls (dense+sparse per batch)
+    pc.inference.embed.side_effect = [
+        _make_dense_response(96),
+        _make_sparse_response(96),
+        _make_dense_response(4),
+        _make_sparse_response(4),
+    ]
+    embedder = PineconeEmbedder(pc, "dense-model", "sparse-model")
+    results = embedder.embed_chunks([_chunk(i) for i in range(100)])
 
-
-def test_embed_query_returns_vector() -> None:
-    vec = np.random.randn(1024).astype("float32")
-    vec /= np.linalg.norm(vec)
-    mock_model = MagicMock()
-    mock_model.encode.return_value = vec
-
-    with patch("sentence_transformers.SentenceTransformer", return_value=mock_model):
-        embedder = Embedder()
-        result = embedder.embed_query("what is the project timeline?")
-
-    assert len(result) == 1024
-    assert abs(math.sqrt(sum(x * x for x in result)) - 1.0) < 1e-5
-
-
-def test_embedder_lazy_loads_model() -> None:
-    with patch("sentence_transformers.SentenceTransformer", return_value=_mock_model(1)) as mock_st:
-        embedder = Embedder()
-        mock_st.assert_not_called()
-        embedder.embed_query("hello")
-        mock_st.assert_called_once_with("BAAI/bge-m3")
+    assert len(results) == 100
+    assert pc.inference.embed.call_count == 4

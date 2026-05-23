@@ -17,15 +17,15 @@ def get_state_dir() -> Path:
 
 class AnchorConfig(BaseModel):
     drive_folder_id: str
-    vector_backend: Literal["chroma", "pinecone"] = "chroma"
-    embedding_model: str = "BAAI/bge-m3"
+    vector_backend: Literal["pinecone"] = "pinecone"
+    pinecone_index: str = "anchor"
+    pinecone_dense_model: str = "multilingual-e5-large"
+    pinecone_sparse_model: str = "pinecone-sparse-english-v0"
+    search_alpha: float = 0.7
     judge_model: str = "anthropic/claude-haiku-4-5"
     chunk_size: int = 800
     chunk_overlap: int = 100
     state_dir: Path = Field(default_factory=get_state_dir)
-    # "auto" lets sentence-transformers pick (uses CUDA if available, else CPU).
-    # Override with "cpu", "cuda", "cuda:0", "mps", etc.
-    device: str = "auto"
 
 
 def load_config(state_dir: Path | None = None) -> AnchorConfig:
@@ -33,9 +33,7 @@ def load_config(state_dir: Path | None = None) -> AnchorConfig:
         state_dir = get_state_dir()
     path = state_dir / "config.json"
     if not path.exists():
-        raise ConfigNotFoundError(
-            f"No config found at {path}. Run `anchor init` to get started."
-        )
+        raise ConfigNotFoundError(f"No config found at {path}. Run `anchor init` to get started.")
     raw: object = json.loads(path.read_text(encoding="utf-8"))
     return AnchorConfig.model_validate(raw)
 

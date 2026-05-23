@@ -1,47 +1,60 @@
-from collections import defaultdict
+import math
+import time
 from typing import Any
 
-from anchor_mcp import secrets
-from anchor_mcp.backends.base import QueryResult, SourceInfo
+from anchor_mcp.backends.base import QueryResult
 from anchor_mcp.chunk import Chunk
+from anchor_mcp.embed import HybridEmbedding
 from anchor_mcp.errors import BackendError
 
 EMBEDDING_DIM = 1024
+_DEFAULT_CLOUD = "aws"
+_DEFAULT_REGION = "us-east-1"
 
 
 class PineconeBackend:
-    def __init__(self) -> None:
-        try:
-            from pinecone import Pinecone  # type: ignore[import-untyped]
-        except ImportError as exc:
-            raise BackendError(
-                "pinecone-client is not installed. "
-                "Install with: pip install 'anchor-mcp[pinecone]'"
-            ) from exc
+    def __init__(self, pc_client: Any, index_name: str = "anchor") -> None:
+        existing = {idx.name for idx in pc_client.list_indexes()}
+        if index_name not in existing:
+            try:
+                from pinecone import ServerlessSpec  # type: ignore[import-untyped]
+            except ImportError as exc:
+                raise BackendError(
+                    "pinecone is not installed. Install with: pip install pinecone"
+                ) from exc
+            pc_client.create_index(
+                name=index_name,
+                dimension=EMBEDDING_DIM,
+                metric="dotproduct",  # required for hybrid search
+                spec=ServerlessSpec(cloud=_DEFAULT_CLOUD, region=_DEFAULT_REGION),
+            )
+            for _ in range(60):
+                if pc_client.describe_index(index_name).status.get("ready", False):
+                    break
+                time.sleep(2)
 
-        api_key = secrets.get_pinecone_api_key()
-        if not api_key:
-            raise BackendError("PINECONE_API_KEY is not set.")
-
-        index_name = secrets.get_pinecone_index_name()
-        pc: Any = Pinecone(api_key=api_key)
-        self._index: Any = pc.Index(index_name)
+        self._index: Any = pc_client.Index(index_name)
 
         stats: Any = self._index.describe_index_stats()
         dim = getattr(stats, "dimension", None)
         if dim is not None and int(dim) != EMBEDDING_DIM:
             raise BackendError(
-                f"Pinecone index dimension {dim} != expected {EMBEDDING_DIM}. "
-                f"Re-create the index with dimension={EMBEDDING_DIM}."
+                f"Pinecone index '{index_name}' has dimension {dim}, "
+                f"but anchor requires {EMBEDDING_DIM}. "
+                f"Delete the index and run 'anchor sync' to recreate it."
             )
 
-    def upsert(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
+    def upsert(self, chunks: list[Chunk], embeddings: list[HybridEmbedding]) -> None:
         if not chunks:
             return
         vectors = [
             {
                 "id": c.id,
-                "values": emb,
+                "values": emb.dense,
+                "sparse_values": {
+                    "indices": emb.sparse.indices,
+                    "values": emb.sparse.values,
+                },
                 "metadata": {
                     "file_id": c.file_id,
                     "file_name": c.file_name,
@@ -59,12 +72,21 @@ class PineconeBackend:
 
     def query(
         self,
-        embedding: list[float],
+        embedding: HybridEmbedding,
         top_k: int,
+        alpha: float = 0.7,
         file_name_filter: str | None = None,
     ) -> list[QueryResult]:
+        # Scale dense by alpha, sparse by (1 - alpha) for hybrid blending
+        scaled_dense = [v * alpha for v in embedding.dense]
+        scaled_sparse = {
+            "indices": embedding.sparse.indices,
+            "values": [v * (1 - alpha) for v in embedding.sparse.values],
+        }
+
         kwargs: dict[str, Any] = {
-            "vector": embedding,
+            "vector": scaled_dense,
+            "sparse_vector": scaled_sparse,
             "top_k": top_k,
             "include_metadata": True,
         }
@@ -73,7 +95,6 @@ class PineconeBackend:
 
         response: Any = self._index.query(**kwargs)
         results: list[QueryResult] = []
-
         for match in response.matches:
             meta: dict[str, Any] = match.metadata or {}
             chunk = Chunk(
@@ -87,55 +108,25 @@ class PineconeBackend:
                 source_url=str(meta.get("source_url")) or None,
             )
             results.append(QueryResult(chunk=chunk, score=float(match.score)))
-
         return results
 
     def delete(self, chunk_ids: list[str]) -> None:
         if chunk_ids:
             self._index.delete(ids=chunk_ids)
 
-    def list_sources(self) -> list[SourceInfo]:
-        counts: dict[str, int] = defaultdict(int)
-        info: dict[str, tuple[str, str]] = {}
-
-        for ids_page in self._index.list():
-            if not ids_page:
-                continue
-            response: Any = self._index.fetch(ids=ids_page)
-            for _vec_id, vec in (response.vectors or {}).items():
-                meta: dict[str, Any] = vec.metadata or {}
-                file_id = str(meta.get("file_id", ""))
-                if not file_id:
-                    continue
-                counts[file_id] += 1
-                if file_id not in info:
-                    info[file_id] = (
-                        str(meta.get("file_name", "")),
-                        str(meta.get("modified_time", "")),
-                    )
-
-        return [
-            SourceInfo(
-                file_id=fid,
-                file_name=info[fid][0],
-                chunk_count=counts[fid],
-                modified_time=info[fid][1],
-            )
-            for fid in counts
-        ]
-
     def count(self) -> int:
         stats: Any = self._index.describe_index_stats()
         return int(stats.total_vector_count)
 
     def get_chunks_by_file(self, file_id: str) -> list[Chunk]:
-        import math
-
-        dim = EMBEDDING_DIM
-        neutral = [1.0 / math.sqrt(dim)] * dim
+        # Neutral dense vector + empty sparse to satisfy Pinecone's query requirement.
+        # The filter on file_id drives the result, not vector similarity.
+        neutral_dense = [1.0 / math.sqrt(EMBEDDING_DIM)] * EMBEDDING_DIM
+        neutral_sparse: dict[str, Any] = {"indices": [], "values": []}
         response: Any = self._index.query(
-            vector=neutral,
-            top_k=1000,
+            vector=neutral_dense,
+            sparse_vector=neutral_sparse,
+            top_k=10_000,
             filter={"file_id": {"$eq": file_id}},
             include_metadata=True,
         )

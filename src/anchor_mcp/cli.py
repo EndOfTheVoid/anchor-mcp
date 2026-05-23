@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any
 
 import click
 
@@ -17,27 +17,25 @@ def cli() -> None:
 def init() -> None:
     """Bootstrap the Anchor state directory with an initial config."""
     folder_id: str = click.prompt("Google Drive folder ID")
-    backend_raw: str = click.prompt(
-        "Vector backend",
-        default="chroma",
-        type=click.Choice(["chroma", "pinecone"]),
-    )
-    backend = cast(Literal["chroma", "pinecone"], backend_raw)
-
-    if not secrets.get_openrouter_api_key():
-        click.echo(
-            "Warning: OPENROUTER_API_KEY is not set. "
-            "The verify_claim tool will be disabled.",
-            err=True,
-        )
+    pinecone_index: str = click.prompt("Pinecone index name", default="anchor")
 
     state_dir = get_state_dir()
-    for subdir in ("cache", "notes", "logs", "chroma"):
+    for subdir in ("cache", "notes", "logs"):
         (state_dir / subdir).mkdir(parents=True, exist_ok=True)
 
-    cfg = AnchorConfig(drive_folder_id=folder_id, vector_backend=backend, state_dir=state_dir)
+    cfg = AnchorConfig(
+        drive_folder_id=folder_id,
+        pinecone_index=pinecone_index,
+        state_dir=state_dir,
+    )
     save_config(cfg)
     click.echo(f"Initialized Anchor at {state_dir}")
+    click.echo(
+        "\nNext steps:\n"
+        "  1. anchor auth login --credentials <path-to-oauth-credentials.json>\n"
+        "  2. Set PINECONE_API_KEY in your environment\n"
+        "  3. anchor sync"
+    )
 
 
 @cli.group("config")
@@ -104,10 +102,11 @@ def doctor() -> None:
         _report(False, "Config", f"Malformed — {exc}")
         all_ok = False
 
-    if secrets.get_openrouter_api_key():
-        _report(True, "OPENROUTER_API_KEY", "Set")
+    if secrets.get_pinecone_api_key():
+        _report(True, "PINECONE_API_KEY", "Set")
     else:
-        _report(False, "OPENROUTER_API_KEY", "Not set — verify_claim tool will be disabled")
+        _report(False, "PINECONE_API_KEY", "Not set — anchor sync will fail")
+        all_ok = False
 
     token_path = state_dir / "oauth_token.json"
     if token_path.exists():
@@ -130,6 +129,7 @@ def _report(ok: bool, label: str, detail: str) -> None:
 
 
 # ── auth ──────────────────────────────────────────────────────────────────────
+
 
 @cli.group("auth")
 def auth_group() -> None:
@@ -163,21 +163,23 @@ def auth_status() -> None:
     if is_authenticated():
         click.echo("Authenticated.")
     else:
-        click.echo(
-            "Not authenticated. Run `anchor auth login --credentials <path>`."
-        )
+        click.echo("Not authenticated. Run `anchor auth login --credentials <path>`.")
         raise SystemExit(1)
 
 
 # ── sync ──────────────────────────────────────────────────────────────────────
 
+
 @cli.command()
 def sync() -> None:
-    """Sync the configured Google Drive folder into the vector store."""
+    """Sync the configured Google Drive folder into Pinecone."""
+    from pinecone import Pinecone  # type: ignore[import-untyped]
+
     from anchor_mcp.auth import load_credentials
-    from anchor_mcp.backends import get_backend
+    from anchor_mcp.backends.pinecone_backend import PineconeBackend
     from anchor_mcp.drive import DriveClient
-    from anchor_mcp.embed import Embedder
+    from anchor_mcp.embed import PineconeEmbedder
+    from anchor_mcp.state_store import get_state_store
     from anchor_mcp.sync import Syncer, SyncState
 
     try:
@@ -190,15 +192,24 @@ def sync() -> None:
     except AuthError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    state_path = cfg.state_dir / "cache" / "sync_state.json"
-    state = SyncState.load(state_path)
+    api_key = secrets.get_pinecone_api_key()
+    if not api_key:
+        raise click.ClickException(
+            "PINECONE_API_KEY is not set. Get your key at https://app.pinecone.io → API Keys."
+        )
+
+    pc: Any = Pinecone(api_key=api_key)
+    embedder = PineconeEmbedder(pc, cfg.pinecone_dense_model, cfg.pinecone_sparse_model)
+    backend = PineconeBackend(pc, cfg.pinecone_index)
+    store = get_state_store(cfg)
+    state = SyncState.load(store)
 
     syncer = Syncer(
         drive=DriveClient(creds),
-        embedder=Embedder(cfg.embedding_model, device=cfg.device, show_progress=True),
-        backend=get_backend(cfg),
+        embedder=embedder,
+        backend=backend,
         state=state,
-        state_path=state_path,
+        store=store,
         chunk_size=cfg.chunk_size,
         chunk_overlap=cfg.chunk_overlap,
     )
@@ -218,24 +229,16 @@ def sync() -> None:
 
 # ── serve ─────────────────────────────────────────────────────────────────────
 
+
 @cli.command()
 def serve() -> None:
     """Start the Anchor MCP server (stdio transport)."""
     import io
-    import os
     import sys
     from typing import Any
 
     # MCP stdio transport requires stdout to carry only JSON-RPC frames.
-    # Any library that prints to stdout corrupts the protocol — suppress what we can.
-    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
-    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-
-    # Replace sys.stdout so text writes (print, library logs) divert to stderr,
-    # but expose the original byte buffer on `.buffer` for MCP's binary protocol.
+    # Any library that prints to stdout corrupts the protocol.
     _real_stdout_buffer = sys.stdout.buffer
 
     _stderr_encoding: str = sys.stderr.encoding or "utf-8"
@@ -258,6 +261,8 @@ def serve() -> None:
 
     sys.stdout = _StdoutToStderr()
 
-    from anchor_mcp.server import mcp
+    from anchor_mcp.server import mcp, start_background_init
+
+    start_background_init()
 
     mcp.run(transport="stdio")

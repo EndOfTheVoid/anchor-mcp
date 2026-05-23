@@ -11,8 +11,8 @@ def test_save_load_roundtrip(tmp_path: Path) -> None:
     save_config(cfg)
     loaded = load_config(state_dir=tmp_path)
     assert loaded.drive_folder_id == "folder123"
-    assert loaded.vector_backend == "chroma"
-    assert loaded.embedding_model == "BAAI/bge-m3"
+    assert loaded.vector_backend == "pinecone"
+    assert loaded.pinecone_dense_model == "multilingual-e5-large"
     assert loaded.state_dir == tmp_path
 
 

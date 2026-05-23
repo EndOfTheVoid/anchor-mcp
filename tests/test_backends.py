@@ -1,21 +1,10 @@
-import math
-import os
-from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from anchor_mcp.backends import get_backend
-from anchor_mcp.backends.chroma_backend import ChromaBackend
+from anchor_mcp.backends.pinecone_backend import PineconeBackend
 from anchor_mcp.chunk import Chunk
-from anchor_mcp.config import AnchorConfig  # noqa: F401
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def _embed(seed: float, dim: int = 4) -> list[float]:
-    """Deterministic unit vector for testing (no real embedder needed)."""
-    vec = [seed + i for i in range(dim)]
-    norm = math.sqrt(sum(x * x for x in vec))
-    return [x / norm for x in vec]
+from anchor_mcp.embed import HybridEmbedding, SparseValues
 
 
 def _chunk(chunk_id: str, file_id: str = "f1", file_name: str = "doc.txt", idx: int = 0) -> Chunk:
@@ -31,136 +20,180 @@ def _chunk(chunk_id: str, file_id: str = "f1", file_name: str = "doc.txt", idx: 
     )
 
 
-# ── ChromaBackend ─────────────────────────────────────────────────────────────
-
-def test_chroma_upsert_and_count(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    chunks = [_chunk("a"), _chunk("b"), _chunk("c")]
-    embeddings = [_embed(1.0), _embed(2.0), _embed(3.0)]
-    backend.upsert(chunks, embeddings)
-    assert backend.count() == 3
-
-
-def test_chroma_upsert_empty_is_noop(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    backend.upsert([], [])
-    assert backend.count() == 0
-
-
-def test_chroma_query_returns_top_match(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    emb_a = _embed(1.0)
-    emb_b = _embed(2.0)
-    emb_c = _embed(100.0)
-    backend.upsert([_chunk("a"), _chunk("b"), _chunk("c")], [emb_a, emb_b, emb_c])
-
-    results = backend.query(emb_a, top_k=1)
-
-    assert len(results) == 1
-    assert results[0].chunk.id == "a"
-    assert results[0].score > 0.99
-
-
-def test_chroma_query_empty_collection_returns_empty(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    results = backend.query(_embed(1.0), top_k=5)
-    assert results == []
-
-
-def test_chroma_query_respects_top_k(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    chunks = [_chunk(f"c{i}") for i in range(10)]
-    embeddings = [_embed(float(i)) for i in range(10)]
-    backend.upsert(chunks, embeddings)
-
-    results = backend.query(_embed(0.0), top_k=3)
-    assert len(results) == 3
-
-
-def test_chroma_delete_removes_chunks(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    backend.upsert([_chunk("a"), _chunk("b")], [_embed(1.0), _embed(2.0)])
-    backend.delete(["a"])
-    assert backend.count() == 1
-
-
-def test_chroma_delete_empty_list_is_noop(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    backend.upsert([_chunk("a")], [_embed(1.0)])
-    backend.delete([])
-    assert backend.count() == 1
-
-
-def test_chroma_list_sources_groups_by_file(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    chunks = [
-        _chunk("a1", file_id="f1", file_name="file1.txt", idx=0),
-        _chunk("a2", file_id="f1", file_name="file1.txt", idx=1),
-        _chunk("b1", file_id="f2", file_name="file2.txt", idx=0),
-    ]
-    backend.upsert(chunks, [_embed(1.0), _embed(2.0), _embed(3.0)])
-
-    sources = backend.list_sources()
-    by_id = {s.file_id: s for s in sources}
-
-    assert len(sources) == 2
-    assert by_id["f1"].chunk_count == 2
-    assert by_id["f2"].chunk_count == 1
-    assert by_id["f1"].file_name == "file1.txt"
-
-
-def test_chroma_list_sources_empty(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    assert backend.list_sources() == []
-
-
-def test_chroma_source_url_roundtrip(tmp_path: Path) -> None:
-    backend = ChromaBackend(tmp_path)
-    chunk = Chunk(
-        id="x",
-        text="text",
-        file_id="f1",
-        file_name="doc.txt",
-        chunk_index=0,
-        token_count=1,
-        modified_time="2024-01-01T00:00:00.000Z",
-        source_url=None,
+def _hybrid(dense_val: float = 0.1, sparse_indices: list[int] | None = None) -> HybridEmbedding:
+    return HybridEmbedding(
+        dense=[dense_val] * 1024,
+        sparse=SparseValues(
+            indices=sparse_indices or [1, 2, 3],
+            values=[0.5, 0.3, 0.2],
+        ),
     )
-    backend.upsert([chunk], [_embed(1.0)])
-    results = backend.query(_embed(1.0), top_k=1)
-    assert results[0].chunk.source_url is None
+
+
+def _make_backend() -> tuple[PineconeBackend, MagicMock]:
+    pc = MagicMock()
+    # Simulate an existing index so create_index is not called
+    existing = MagicMock()
+    existing.name = "anchor"
+    pc.list_indexes.return_value = [existing]
+
+    index = MagicMock()
+    pc.Index.return_value = index
+
+    stats = MagicMock()
+    stats.dimension = 1024
+    stats.total_vector_count = 0
+    index.describe_index_stats.return_value = stats
+
+    backend = PineconeBackend(pc, "anchor")
+    return backend, index
+
+
+# ── upsert ────────────────────────────────────────────────────────────────────
+
+
+def test_upsert_includes_dense_and_sparse_values() -> None:
+    backend, index = _make_backend()
+    chunk = _chunk("c1")
+    emb = _hybrid()
+    backend.upsert([chunk], [emb])
+
+    vectors = index.upsert.call_args.kwargs["vectors"]
+    assert len(vectors) == 1
+    v = vectors[0]
+    assert v["values"] == emb.dense
+    assert "sparse_values" in v
+    assert v["sparse_values"]["indices"] == [1, 2, 3]
+    assert v["sparse_values"]["values"] == [0.5, 0.3, 0.2]
+
+
+def test_upsert_empty_is_noop() -> None:
+    backend, index = _make_backend()
+    backend.upsert([], [])
+    index.upsert.assert_not_called()
+
+
+def test_upsert_includes_metadata() -> None:
+    backend, index = _make_backend()
+    chunk = _chunk("c1", file_id="f1", file_name="myfile.txt")
+    backend.upsert([chunk], [_hybrid()])
+
+    vectors = index.upsert.call_args.kwargs["vectors"]
+    meta = vectors[0]["metadata"]
+    assert meta["file_id"] == "f1"
+    assert meta["file_name"] == "myfile.txt"
+    assert meta["text"] == "text for c1"
+
+
+# ── query ─────────────────────────────────────────────────────────────────────
+
+
+def _empty_query_response() -> MagicMock:
+    resp = MagicMock()
+    resp.matches = []
+    return resp
+
+
+def test_query_scales_dense_by_alpha() -> None:
+    backend, index = _make_backend()
+    index.query.return_value = _empty_query_response()
+    emb = _hybrid(dense_val=1.0)
+    backend.query(emb, top_k=5, alpha=0.7)
+
+    kwargs = index.query.call_args.kwargs
+    expected = [1.0 * 0.7] * 1024
+    assert kwargs["vector"] == pytest.approx(expected)
+
+
+def test_query_scales_sparse_by_one_minus_alpha() -> None:
+    backend, index = _make_backend()
+    index.query.return_value = _empty_query_response()
+    emb = _hybrid()
+    backend.query(emb, top_k=5, alpha=0.7)
+
+    kwargs = index.query.call_args.kwargs
+    expected_sparse_vals = [v * 0.3 for v in emb.sparse.values]
+    assert kwargs["sparse_vector"]["values"] == pytest.approx(expected_sparse_vals)
+    assert kwargs["sparse_vector"]["indices"] == [1, 2, 3]
+
+
+def test_query_alpha_0_zeroes_dense() -> None:
+    backend, index = _make_backend()
+    index.query.return_value = _empty_query_response()
+    backend.query(_hybrid(dense_val=1.0), top_k=5, alpha=0.0)
+
+    kwargs = index.query.call_args.kwargs
+    assert all(v == pytest.approx(0.0) for v in kwargs["vector"])
+
+
+def test_query_alpha_1_zeroes_sparse() -> None:
+    backend, index = _make_backend()
+    index.query.return_value = _empty_query_response()
+    backend.query(_hybrid(), top_k=5, alpha=1.0)
+
+    kwargs = index.query.call_args.kwargs
+    assert all(v == pytest.approx(0.0) for v in kwargs["sparse_vector"]["values"])
+
+
+def test_query_with_file_name_filter() -> None:
+    backend, index = _make_backend()
+    index.query.return_value = _empty_query_response()
+    backend.query(_hybrid(), top_k=3, file_name_filter="report.pdf")
+
+    kwargs = index.query.call_args.kwargs
+    assert kwargs["filter"] == {"file_name": {"$eq": "report.pdf"}}
+
+
+def test_query_without_filter_has_no_filter_key() -> None:
+    backend, index = _make_backend()
+    index.query.return_value = _empty_query_response()
+    backend.query(_hybrid(), top_k=3)
+
+    kwargs = index.query.call_args.kwargs
+    assert "filter" not in kwargs
+
+
+# ── delete ────────────────────────────────────────────────────────────────────
+
+
+def test_delete_calls_index_delete() -> None:
+    backend, index = _make_backend()
+    backend.delete(["c1", "c2"])
+    index.delete.assert_called_once_with(ids=["c1", "c2"])
+
+
+def test_delete_empty_list_is_noop() -> None:
+    backend, index = _make_backend()
+    backend.delete([])
+    index.delete.assert_not_called()
+
+
+# ── get_chunks_by_file ────────────────────────────────────────────────────────
+
+
+def test_get_chunks_by_file_passes_file_id_filter() -> None:
+    backend, index = _make_backend()
+    index.query.return_value = _empty_query_response()
+    backend.get_chunks_by_file("f1")
+
+    kwargs = index.query.call_args.kwargs
+    assert kwargs["filter"] == {"file_id": {"$eq": "f1"}}
+    assert kwargs["top_k"] == 10_000
 
 
 # ── factory ───────────────────────────────────────────────────────────────────
 
-def test_get_backend_returns_chroma(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    cfg = AnchorConfig(drive_folder_id="x", vector_backend="chroma", state_dir=tmp_path)
-    backend = get_backend(cfg)
-    assert isinstance(backend, ChromaBackend)
 
+def test_get_backend_unknown_raises() -> None:
+    import pytest
 
-# ── Pinecone (skipped without API key) ───────────────────────────────────────
+    from anchor_mcp.backends import get_backend
+    from anchor_mcp.config import AnchorConfig
+    from anchor_mcp.errors import BackendError
 
-_HAS_PINECONE = False
-try:
-    import pinecone as _pinecone_pkg  # noqa: F401
-
-    _HAS_PINECONE = True
-except ImportError:
-    pass
-
-@pytest.mark.skipif(
-    not _HAS_PINECONE or not os.environ.get("PINECONE_API_KEY"),
-    reason="pinecone-client not installed or PINECONE_API_KEY not set",
-)
-def test_pinecone_backend_roundtrip() -> None:
-    from anchor_mcp.backends.pinecone_backend import PineconeBackend
-
-    backend = PineconeBackend()
-    chunk = _chunk("test-chunk-sprint4")
-    embedding = _embed(1.0, dim=1024)
-    backend.upsert([chunk], [embedding])
-    results = backend.query(embedding, top_k=1)
-    assert len(results) >= 1
-    backend.delete(["test-chunk-sprint4"])
+    # AnchorConfig only allows "pinecone" so we bypass validation
+    cfg = AnchorConfig.model_construct(
+        vector_backend="unknown", pinecone_index="x", drive_folder_id="y"
+    )  # type: ignore[call-arg]
+    with pytest.raises(BackendError, match="Unknown vector backend"):
+        get_backend(cfg)

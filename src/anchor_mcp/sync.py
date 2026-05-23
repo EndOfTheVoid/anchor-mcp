@@ -1,6 +1,5 @@
 import json
 from collections.abc import Callable
-from pathlib import Path
 
 from pydantic import BaseModel, Field
 from tqdm.auto import tqdm
@@ -8,11 +7,41 @@ from tqdm.auto import tqdm
 from anchor_mcp.backends.base import VectorBackend
 from anchor_mcp.chunk import chunk_text
 from anchor_mcp.drive import DriveClient, DriveFile
-from anchor_mcp.embed import Embedder
+from anchor_mcp.embed import PineconeEmbedder
 from anchor_mcp.extract import extract_text
+from anchor_mcp.state_store import StateStore
+
+# ── file registry (sidecar) ───────────────────────────────────────────────────
+
+
+class RegistryEntry(BaseModel):
+    file_name: str
+    chunk_count: int
+    modified_time: str
+
+
+class FileRegistry(BaseModel):
+    """Portable sidecar that lists every indexed file without touching the vector backend."""
+
+    files: dict[str, RegistryEntry] = Field(default_factory=dict)
+
+    @classmethod
+    def load(cls, store: StateStore) -> "FileRegistry":
+        data = store.read("file_registry.json")
+        if data is None:
+            return cls()
+        raw: object = json.loads(data)
+        return cls.model_validate(raw)
+
+    def save(self, store: StateStore) -> None:
+        store.write("file_registry.json", self.model_dump_json(indent=2).encode())
+
+
+# ── sync state ────────────────────────────────────────────────────────────────
 
 
 class FileState(BaseModel):
+    file_name: str = ""
     modified_time: str
     md5_checksum: str | None = None
     chunk_ids: list[str] = Field(default_factory=list)
@@ -22,17 +51,32 @@ class SyncState(BaseModel):
     files: dict[str, FileState] = Field(default_factory=dict)
 
     @classmethod
-    def load(cls, path: Path) -> "SyncState":
-        if not path.exists():
+    def load(cls, store: StateStore) -> "SyncState":
+        data = store.read("sync_state.json")
+        if data is None:
             return cls()
-        raw: object = json.loads(path.read_text(encoding="utf-8"))
+        raw: object = json.loads(data)
         return cls.model_validate(raw)
 
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(self.model_dump_json(indent=2), encoding="utf-8")
-        tmp.replace(path)
+    def save(self, store: StateStore) -> None:
+        store.write("sync_state.json", self.model_dump_json(indent=2).encode())
+
+    def to_registry(self) -> FileRegistry:
+        """Derive a FileRegistry from the current sync state (for migration)."""
+        return FileRegistry(
+            files={
+                fid: RegistryEntry(
+                    file_name=fs.file_name,
+                    chunk_count=len(fs.chunk_ids),
+                    modified_time=fs.modified_time,
+                )
+                for fid, fs in self.files.items()
+                if fs.file_name
+            }
+        )
+
+
+# ── sync report ───────────────────────────────────────────────────────────────
 
 
 class SyncReport(BaseModel):
@@ -43,14 +87,17 @@ class SyncReport(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+# ── syncer ────────────────────────────────────────────────────────────────────
+
+
 class Syncer:
     def __init__(
         self,
         drive: DriveClient,
-        embedder: Embedder,
+        embedder: PineconeEmbedder,
         backend: VectorBackend,
         state: SyncState,
-        state_path: Path,
+        store: StateStore,
         chunk_size: int = 800,
         chunk_overlap: int = 100,
     ) -> None:
@@ -58,7 +105,7 @@ class Syncer:
         self._embedder = embedder
         self._backend = backend
         self._state = state
-        self._state_path = state_path
+        self._store = store
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
 
@@ -69,6 +116,12 @@ class Syncer:
         show_progress: bool = False,
     ) -> SyncReport:
         report = SyncReport()
+
+        # If the backend is empty but sync state has entries, the user likely switched
+        # backends or wiped Pinecone. Force a full re-sync.
+        if self._state.files and self._backend.count() == 0:
+            self._state = SyncState()
+
         drive_files = self._drive.list_files(folder_id)
         drive_ids = {f.id for f in drive_files}
 
@@ -103,6 +156,8 @@ class Syncer:
                 except Exception as exc:
                     report.errors.append(f"delete {file_id}: {exc}")
 
+        self._state.to_registry().save(self._store)
+
         return report
 
     # ── private ───────────────────────────────────────────────────────────────
@@ -116,31 +171,31 @@ class Syncer:
         embeddings = self._embedder.embed_chunks(chunks)
         self._backend.upsert(chunks, embeddings)
         self._state.files[file.id] = FileState(
+            file_name=file.name,
             modified_time=file.modified_time,
             md5_checksum=file.md5_checksum,
             chunk_ids=[c.id for c in chunks],
         )
-        self._state.save(self._state_path)
+        self._state.save(self._store)
 
     def _update_file(self, file: DriveFile, progress_cb: Callable[[str], None] | None) -> None:
         if progress_cb:
             progress_cb(f"Updating {file.name}")
-        # Compute new content first — safe to fail here, nothing changed yet
         raw = self._drive.download_file(file.id, file.mime_type)
         text = extract_text(file, raw)
         new_chunks = chunk_text(text, file, self._chunk_size, self._chunk_overlap)
         new_embeddings = self._embedder.embed_chunks(new_chunks)
-        # Replace old with new
         self._backend.delete(self._state.files[file.id].chunk_ids)
         self._backend.upsert(new_chunks, new_embeddings)
         self._state.files[file.id] = FileState(
+            file_name=file.name,
             modified_time=file.modified_time,
             md5_checksum=file.md5_checksum,
             chunk_ids=[c.id for c in new_chunks],
         )
-        self._state.save(self._state_path)
+        self._state.save(self._store)
 
     def _delete_file(self, file_id: str) -> None:
         self._backend.delete(self._state.files[file_id].chunk_ids)
         del self._state.files[file_id]
-        self._state.save(self._state_path)
+        self._state.save(self._store)

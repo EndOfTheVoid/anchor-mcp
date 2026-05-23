@@ -1,52 +1,66 @@
 from typing import Any
 
+from pydantic import BaseModel
+
 from anchor_mcp.chunk import Chunk
+from anchor_mcp.errors import BackendError
 
-EMBEDDING_DIM = 1024
-_BATCH_SIZE = 32
+_BATCH_SIZE = 96
 
 
-class Embedder:
-    """Wraps bge-m3 via sentence-transformers. Model is lazy-loaded on first use."""
+class SparseValues(BaseModel):
+    indices: list[int]
+    values: list[float]
 
-    def __init__(
-        self,
-        model_name: str = "BAAI/bge-m3",
-        device: str = "auto",
-        show_progress: bool = False,
-    ) -> None:
-        self._model_name = model_name
-        self._device: str | None = None if device == "auto" else device
-        self._show_progress = show_progress
-        self._model: Any = None
 
-    def _get_model(self) -> Any:
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]
+class HybridEmbedding(BaseModel):
+    dense: list[float]
+    sparse: SparseValues
 
-            kwargs: dict[str, Any] = {}
-            if self._device is not None:
-                kwargs["device"] = self._device
-            self._model = SentenceTransformer(self._model_name, **kwargs)
-        return self._model
 
-    def embed_chunks(self, chunks: list[Chunk]) -> list[list[float]]:
+class PineconeEmbedder:
+    def __init__(self, pc_client: Any, dense_model: str, sparse_model: str) -> None:
+        self._pc = pc_client
+        self._dense_model = dense_model
+        self._sparse_model = sparse_model
+
+    def embed_chunks(self, chunks: list[Chunk]) -> list[HybridEmbedding]:
         if not chunks:
             return []
-        model = self._get_model()
-        result: list[list[float]] = model.encode(
-            [c.text for c in chunks],
-            batch_size=_BATCH_SIZE,
-            normalize_embeddings=True,
-            show_progress_bar=self._show_progress,
-        ).tolist()
-        return result
+        return self._embed_texts([c.text for c in chunks], input_type="passage")
 
-    def embed_query(self, text: str) -> list[float]:
-        model = self._get_model()
-        result: list[float] = model.encode(
-            text,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        ).tolist()
-        return result
+    def embed_query(self, text: str) -> HybridEmbedding:
+        return self._embed_texts([text], input_type="query")[0]
+
+    def _embed_texts(self, texts: list[str], input_type: str) -> list[HybridEmbedding]:
+        results: list[HybridEmbedding] = []
+        for i in range(0, len(texts), _BATCH_SIZE):
+            batch = texts[i : i + _BATCH_SIZE]
+            results.extend(self._embed_batch(batch, input_type))
+        return results
+
+    def _embed_batch(self, texts: list[str], input_type: str) -> list[HybridEmbedding]:
+        try:
+            dense_response: Any = self._pc.inference.embed(
+                model=self._dense_model,
+                inputs=texts,
+                parameters={"input_type": input_type, "truncate": "END"},
+            )
+            sparse_response: Any = self._pc.inference.embed(
+                model=self._sparse_model,
+                inputs=texts,
+                parameters={"input_type": input_type},
+            )
+        except Exception as exc:
+            raise BackendError(f"Pinecone inference API call failed: {exc}") from exc
+
+        return [
+            HybridEmbedding(
+                dense=list(d.values),
+                sparse=SparseValues(
+                    indices=list(s.sparse_values.indices),
+                    values=list(s.sparse_values.values),
+                ),
+            )
+            for d, s in zip(dense_response, sparse_response, strict=True)
+        ]
