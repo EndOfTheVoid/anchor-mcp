@@ -1,6 +1,6 @@
 from typing import Any
 
-from google.oauth2.credentials import Credentials
+from google.auth.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-untyped]
 from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 from pydantic import BaseModel, Field
@@ -36,9 +36,7 @@ class DriveClient:
         self._collect_files(folder_id, results, recursive)
         return results
 
-    def _collect_files(
-        self, folder_id: str, results: list[DriveFile], recursive: bool
-    ) -> None:
+    def _collect_files(self, folder_id: str, results: list[DriveFile], recursive: bool) -> None:
         query = f"'{folder_id}' in parents and trashed = false"
         page_token: str | None = None
 
@@ -52,9 +50,7 @@ class DriveClient:
                 kwargs["pageToken"] = page_token
 
             try:
-                response: dict[str, Any] = _execute(
-                    self._service.files().list(**kwargs)
-                )
+                response: dict[str, Any] = _execute(self._service.files().list(**kwargs))
             except HttpError as exc:
                 raise SyncError(f"Failed to list files in {folder_id!r}") from exc
 

@@ -1,0 +1,39 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - gcr.io/$PROJECT_ID/anchor-mcp:$SHORT_SHA
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - gcr.io/$PROJECT_ID/anchor-mcp:$SHORT_SHA
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - anchor-mcp
+      - --image=gcr.io/$PROJECT_ID/anchor-mcp:$SHORT_SHA
+      - --region=us-central1
+      - --service-account=anchor-sa@$PROJECT_ID.iam.gserviceaccount.com
+      - --allow-unauthenticated
+      - --set-secrets=PINECONE_API_KEY=PINECONE_API_KEY:latest,OPENROUTER_API_KEY=OPENROUTER_API_KEY:latest,GOOGLE_SERVICE_ACCOUNT_KEY=GOOGLE_SERVICE_ACCOUNT_KEY:latest,GOOGLE_OAUTH_CLIENT_ID=GOOGLE_OAUTH_CLIENT_ID:latest,GOOGLE_OAUTH_CLIENT_SECRET=GOOGLE_OAUTH_CLIENT_SECRET:latest,JWT_SECRET=JWT_SECRET:latest
+      - --set-env-vars=GCS_BUCKET=anchor-$PROJECT_ID-state
+      - --port=8080
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        URL=$(gcloud run services describe anchor-mcp \
+          --region=us-central1 \
+          --format='value(status.url)')
+        curl -sf "$URL/health"
+
+images:
+  - gcr.io/$PROJECT_ID/anchor-mcp:$SHORT_SHA

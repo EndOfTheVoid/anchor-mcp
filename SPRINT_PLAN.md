@@ -1,13 +1,15 @@
 # Anchor — Master Sprint Plan
 
-> **Project**: `anchor-mcp` — a local-first MCP server that grounds LLMs in a Google Drive folder, with source-cited retrieval, append-only knowledge capture, and BYOK faithfulness verification.
+> **Project**: `anchor-mcp` — an MCP server that grounds LLMs in a Google Drive corpus, with source-cited hybrid retrieval, server-side faithfulness verification, and a cloud-native multi-user deployment.
 >
 > **Owner**: Atharva. Implementation by Claude Code. Default model: **Sonnet**. Opus only on sprints marked `[OPUS]`.
 >
-> **Transport**: stdio (local, single-user).
-> **Judge LLM**: BYOK via OpenRouter.
-> **Vector backend**: ChromaDB local (default), Pinecone optional via env.
-> **Embeddings**: bge-m3 local via sentence-transformers (free, multilingual, 8192-token context).
+> **Transport**: StreamableHTTP (Cloud Run). Local stdio mode retained for dev only.
+> **Judge LLM**: OpenRouter (model-agnostic BYOK).
+> **Vector backend**: Pinecone Serverless only (hybrid dense + sparse BM25).
+> **Embeddings**: Pinecone inference API (server-side, no local model).
+> **Drive auth**: Google Service Account (no user OAuth for Drive).
+> **User auth**: Google OAuth as identity provider → server-issued JWT → email allowlist in GCS.
 >
 > This document is the single source of truth. If a sprint disagrees with this header, the header wins.
 
@@ -19,489 +21,500 @@
 2. **No scope creep.** If a sprint says "implement X," do not also implement Y, Z, or "while we're here, let's add..." Anything not in the sprint goes into `BACKLOG.md`.
 3. **Stay within the locked architectural decisions** (see header). Do not propose alternative transports, chunking strategies, or providers mid-sprint. If you believe the locked decision is wrong, stop and surface it as a question.
 4. **Token discipline.** Each sprint has a target token budget. If you're at 80% of budget and not done, stop, write what's done into `SPRINT_NOTES.md`, and ask for direction.
-5. **Tests are not optional**, but they are minimal: unit tests for pure functions, one integration test per MCP tool, no test for things that require live OAuth (mock the Drive client).
+5. **Tests are not optional**, but they are minimal: unit tests for pure functions, one integration test per MCP tool, no test for things that require live external APIs (mock them).
 6. **Type-check with pyright strict.** Lint with ruff. Format with ruff format. Every sprint ends green.
 7. **Commit at the end of every sprint** with message `sprint-N: <one-line summary>`. Do not commit mid-sprint unless explicitly told.
 8. **Refuse anti-patterns** listed in each sprint. These are explicit "do not do this" items based on common Claude Code drift.
 
 ---
 
-## Architecture summary (pre-thinking, applies to all sprints)
+## Architecture (current — cloud-native)
 
 ```
-┌─────────────────────┐
-│  Claude Desktop /   │   stdio
-│  Claude Code CLI    │◄─────────┐
-└─────────────────────┘          │
-                                 │
-                    ┌────────────▼──────────────┐
-                    │   anchor-mcp (FastMCP)    │
-                    │  ┌─────────────────────┐  │
-                    │  │ MCP Tools:          │  │
-                    │  │  - search           │  │
-                    │  │  - get_document     │  │
-                    │  │  - list_sources     │  │
-                    │  │  - add_note         │  │
-                    │  │  - verify_claim     │  │
-                    │  │  - sync_drive       │  │
-                    │  └─────────────────────┘  │
-                    └─┬───────────┬─────────┬───┘
-                      │           │         │
-              ┌───────▼──┐  ┌─────▼─────┐  ┌▼──────────┐
-              │ Google   │  │ Vector    │  │ OpenRouter│
-              │ Drive    │  │ Backend   │  │ (judge)   │
-              │ API      │  │ (Chroma   │  │           │
-              │          │  │ /Pinecone)│  │           │
-              └──────────┘  └───────────┘  └───────────┘
+                        ┌──────────────────────────────────────────┐
+                        │          Google Cloud Run                │
+                        │          anchor-mcp service              │
+                        │                                          │
+  Claude Desktop        │  FastMCP (StreamableHTTP)                │
+  any OS, any machine   │  ┌────────────────────────────────────┐  │
+  ──HTTPS + JWT──────►  │  │ OAuth endpoints                    │  │
+                        │  │  /.well-known/oauth-auth-server    │  │
+                        │  │  /oauth/authorize  /oauth/token    │  │
+                        │  │  /oauth/callback   /admin/users    │  │
+                        │  ├────────────────────────────────────┤  │
+                        │  │ MCP Tools (readers)                │  │
+                        │  │  search        → Pinecone          │  │
+                        │  │  get_document  → Pinecone          │  │
+                        │  │  list_sources  → GCS sidecar       │  │
+                        │  │  verify_claim  → OpenRouter        │  │
+                        │  ├────────────────────────────────────┤  │
+                        │  │ MCP Tools (admin only)             │  │
+                        │  │  sync_drive    → Drive + Pinecone  │  │
+                        │  │  add_note      → GCS + Pinecone    │  │
+                        │  └────────────────────────────────────┘  │
+                        │                                          │
+                        │  Service Account → Google Drive          │
+                        │  Secret Manager  → all API keys          │
+                        └───────────┬──────────────────────────────┘
+                                    │
+              ┌─────────────────────┼──────────────────────┐
+              │                     │                      │
+       [Pinecone Serverless]    [Cloud Storage]      [OpenRouter]
+       hybrid vectors           file_registry.json   judge LLM
+       (dense + sparse BM25)    sync_state.json      (any model)
+                                allowlist.json
 ```
 
-**Local state directory** (`~/.anchor/`):
-- `config.json` — folder ID, backend choice, embedding model
-- `oauth_token.json` — Drive OAuth refresh token (encrypted at rest)
-- `chroma/` — ChromaDB persistent storage (if local backend)
-- `cache/sync_state.json` — last sync timestamp, file modified-time map
-- `notes/` — sidecar markdown for `add_note` (auditable, human-readable)
-- `logs/anchor.log` — rotating log
+**GCS bucket** (`anchor-{project}-state`):
+- `file_registry.json` — indexed file listing (name, chunk count, modified time). Instant `list_sources`, no Pinecone call needed.
+- `sync_state.json` — per-file modified time + chunk ID list. Drives incremental sync.
+- `allowlist.json` — `{"readers": ["a@org.com"], "admins": ["you@org.com"]}`. Admin edits this to grant/revoke access.
+- `notes/` — sidecar markdown for `add_note`.
 
-**Locked dependencies** (pin in `pyproject.toml`):
-- `mcp[cli]>=1.27` (FastMCP)
-- `google-api-python-client`, `google-auth-oauthlib`, `google-auth-httplib2`
-- `chromadb>=0.5`
-- `sentence-transformers>=3.0` (for bge-m3)
-- `pypdf>=4.0`
-- `httpx` (for OpenRouter)
-- `pydantic>=2`
-- `click` (CLI)
-- `cryptography` (token encryption at rest)
-- `pinecone-client` (optional, behind extras)
+**Secret Manager secrets** (all accessed by the Cloud Run service account):
+- `PINECONE_API_KEY`
+- `OPENROUTER_API_KEY`
+- `GOOGLE_SERVICE_ACCOUNT_KEY` — JSON key for Drive read access
+- `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` — for user auth dance
+- `JWT_SECRET` — symmetric key for signing user JWTs
 
-Dev: `pytest`, `pytest-asyncio`, `ruff`, `pyright`.
+**Roles**:
+- `reader` — search, get_document, list_sources, verify_claim
+- `admin` — all reader tools + sync_drive, add_note, /admin/users endpoint
+
+Role is embedded in the JWT claim and checked per-tool at runtime.
 
 ---
 
-# Sprint 0 — README and project skeleton  [SONNET] [~12k tokens]
+## Locked dependencies
 
-**Goal**: produce a complete, CV-quality README that describes the *intended* product, plus the empty Python project skeleton. Atharva can list this on his CV and apply immediately while the rest of the build proceeds asynchronously.
+```toml
+# Runtime
+mcp[cli]>=1.27            # FastMCP, StreamableHTTP support
+google-api-python-client  # Drive API
+google-auth-oauthlib      # OAuth flow (user auth dance)
+google-auth-httplib2
+google-cloud-storage      # GCS state files
+pinecone>=3.0             # Pinecone client + inference API
+pypdf>=4.0                # PDF extraction
+httpx>=0.27               # OpenRouter judge calls
+pydantic>=2.0
+click>=8.0
+cryptography>=42.0        # token encryption
+tiktoken>=0.7             # chunk token counting
+tenacity>=8.0             # retry logic
+PyJWT>=2.0                # JWT issuance and validation
+```
+
+No `sentence-transformers`. No `torch`. No `chromadb`. Docker image target: ~90MB.
+
+---
+
+# Sprints 0–6 — COMPLETED
+
+These sprints shipped the local-first stdio version of Anchor. Brief record kept for context.
+
+## Sprint 0 ✓ — README + project skeleton
+Delivered: `pyproject.toml`, project tree, MIT license, `.gitignore`, README describing intended v1 product.
+
+## Sprint 1 ✓ — Config + CLI
+Delivered: `config.py` (Pydantic `AnchorConfig`), `cli.py` (Click: `init`, `config show/set`, `doctor`, `auth login/status`, `sync`, `serve`), `errors.py`, `secrets.py`.
+
+## Sprint 2 ✓ — Google Drive OAuth + file enumeration
+Delivered: `auth.py` (InstalledAppFlow, token encrypted at rest with Fernet), `drive.py` (`DriveClient` with pagination and exponential-backoff retry).
+
+## Sprint 3 ✓ — Text extraction + chunking
+Delivered: `extract.py` (PDF via pypdf, plain text, Google Docs export), `chunk.py` (`Chunk` model with deterministic ID, recursive character splitter, tiktoken token counting).
+
+## Sprint 4 ✓ — Vector backend + embedding
+Delivered: `embed.py` (BGE-M3 via sentence-transformers, lazy-loaded), `backends/base.py` (Protocol), `backends/chroma_backend.py`, `backends/pinecone_backend.py`.
+
+**Post-sprint architectural change (Sprint 7 prep):**
+ChromaDB removed entirely. Pinecone is now the only backend. BGE-M3 removed from server path — Pinecone inference replaces it in Sprint 7-A.
+
+## Sprint 5 ✓ — Sync engine
+Delivered: `sync.py` (`SyncState`, `FileState`, `Syncer` with add/update/delete diff, `SyncReport`). Auto-migration: if backend is empty but sync state has entries, forces full re-sync (handles backend switch).
+
+**Post-sprint addition:** `FileRegistry` / `RegistryEntry` sidecar written after every sync. `FileState` now stores `file_name`. `list_sources` reads the sidecar — no backend call.
+
+## Sprint 6 ✓ — MCP server (read tools)
+Delivered: `server.py` (FastMCP, `search`, `get_document`, `list_sources`, `sync_drive`). Stdout protected from library noise. `_ensure_config()` lightweight singleton for `list_sources`. `_ensure_initialized()` full singleton (config + backend) for search/get_document/sync. `start_background_init()` for warm startup.
+
+**Post-sprint additions:** device config (cpu/cuda/mps), tqdm progress bars on sync, fix for stdout/stdio corruption.
+
+---
+
+# Sprint 7 — Backend migration: Pinecone inference + hybrid search + GCS  [SONNET] [~25k tokens]
+
+**Goal**: replace local BGE-M3 with Pinecone's inference API, add hybrid (dense + sparse BM25) retrieval for better citation accuracy, and move all state files to Cloud Storage. This makes the server fully stateless — a prerequisite for Cloud Run.
 
 ## Pre-thinking checklist
-- [ ] Read this entire SPRINT_PLAN.md before starting.
-- [ ] Confirm: project name is `anchor-mcp` (PyPI), product name is "Anchor."
-- [ ] Confirm: the README describes intended capabilities at v1, not "TODO" or "coming soon."
+- [ ] Read the header. BGE-M3 and sentence-transformers are **gone**. Do not add them back.
+- [ ] Pinecone inference endpoint: `pc.inference.embed(model, inputs, parameters)`. Returns a list of embedding objects. Dense model: `"multilingual-e5-large"` (1024-dim). Sparse model: `"pinecone-sparse-english-v0"` (BM25-based).
+- [ ] Hybrid upsert: each vector has both `values` (dense float list) and `sparse_values` (dict of `{indices: [...], values: [...]}`)
+- [ ] Hybrid query: pass both `vector` and `sparse_vector`, plus `alpha` (0.0 = keyword-only, 1.0 = semantic-only, default 0.7).
+- [ ] GCS access: use `google-cloud-storage`. Service account has `roles/storage.objectAdmin` on the bucket.
+- [ ] Local dev fallback: if `GCS_BUCKET` env var is unset, fall back to local file paths. This keeps `anchor sync` working locally during development.
+- [ ] The existing Pinecone index was created with dimension 1024 for BGE-M3. `multilingual-e5-large` is also 1024-dim — compatible. But vectors were embedded with a different model, so do a **clean wipe and full re-sync** after this sprint.
 
 ## Implementation steps
-1. Create repo structure:
+
+### 7-A: PineconeEmbedder (replaces Embedder)
+1. Create `src/anchor_mcp/embed.py` (rewrite, not extend):
+   - Remove `SentenceTransformer` entirely.
+   - `PineconeEmbedder` class. `__init__(pc_client, dense_model, sparse_model)`.
+   - `embed_chunks(chunks) -> list[HybridEmbedding]` where `HybridEmbedding = {dense: list[float], sparse: SparseValues}`.
+   - `embed_query(text) -> HybridEmbedding` — same, single input.
+   - `SparseValues` pydantic model: `indices: list[int]`, `values: list[float]`.
+   - Batch chunks in groups of 96 (Pinecone inference API limit).
+   - Raise `BackendError` with clear message if inference API call fails.
+2. Update `pyproject.toml`: remove `sentence-transformers`. `pinecone>=3.0` stays (already there).
+
+### 7-B: Hybrid upsert + query in PineconeBackend
+1. Update `backends/pinecone_backend.py`:
+   - `upsert(chunks, embeddings: list[HybridEmbedding])` — include `sparse_values` in each vector dict.
+   - `query(embedding: HybridEmbedding, top_k, alpha=0.7, file_name_filter=None)` — pass `vector`, `sparse_vector`, `alpha` to Pinecone query.
+   - Update `get_chunks_by_file` neutral vector: generate a dummy dense vector via `embed_query` (or use the embedder reference stored at init).
+2. Update `backends/base.py` Protocol to use `HybridEmbedding` instead of `list[float]`.
+3. Update `VectorBackend` Protocol — `query` now takes `HybridEmbedding`.
+
+### 7-C: GCS state store
+1. Create `src/anchor_mcp/state_store.py`:
+   - `StateStore` abstract Protocol: `read(key: str) -> bytes | None`, `write(key: str, data: bytes) -> None`.
+   - `GCSStateStore(bucket_name: str)` — wraps `google.cloud.storage.Client`. Reads/writes blobs.
+   - `LocalStateStore(base_dir: Path)` — reads/writes local files. Used when `GCS_BUCKET` is unset.
+   - `get_state_store(config: AnchorConfig) -> StateStore` factory — checks `GCS_BUCKET` env var.
+2. Update `FileRegistry.load/save` and `SyncState.load/save` to accept a `StateStore` instead of a `Path`.
+3. Update `Syncer.__init__` to take a `StateStore`.
+4. Update `server.py` `_ensure_config()` to also initialise a state store singleton (`_state_store`).
+5. Update `server.py` `list_sources` to call `_state_store.read("file_registry.json")`.
+6. Update `sync_drive` tool to pass `_state_store` to the `Syncer`.
+7. Update `cli.py` `sync` command similarly.
+
+### 7-D: Config updates
+1. Update `AnchorConfig`:
+   - Remove `device` field (no local model).
+   - Add `pinecone_dense_model: str = "multilingual-e5-large"`.
+   - Add `pinecone_sparse_model: str = "pinecone-sparse-english-v0"`.
+   - Add `search_alpha: float = 0.7` (default hybrid blend).
+2. Update `cli.py` `init` command: drop device prompt, no mention of chroma.
+3. Wipe `~/.anchor/cache/sync_state.json` and Pinecone index before running first post-migration sync.
+
+### 7-E: Update search tool signature
+- `search(query, top_k=5, alpha=None, file_name_filter=None)` — `alpha` overrides config default if provided. Add to tool description: "alpha controls keyword vs semantic balance (0=keyword, 1=semantic, default 0.7)."
+
+### 7-F: Tests
+- Mock `pc.inference.embed` returning synthetic dense + sparse outputs.
+- Hybrid upsert: verify vector dict shape contains both `values` and `sparse_values`.
+- Hybrid query: verify `alpha` is forwarded correctly.
+- GCS state store: mock `google.cloud.storage.Client`, verify read/write calls.
+- Local state store: real filesystem, temp dir, round-trip test.
+
+## Anti-patterns (refuse)
+- Do NOT import or reference `sentence_transformers`, `torch`, or `chromadb` anywhere.
+- Do NOT add a re-ranking layer. Hybrid is the retrieval improvement; re-ranking is backlog.
+- Do NOT compute embeddings in the request path for sync (it's already async enough); batch them.
+- Do NOT store raw chunk text in GCS — it belongs in Pinecone metadata, as it is now.
+
+## Acceptance criteria
+- `pip install -e .` in a fresh venv has no torch/sentence-transformers download.
+- `anchor sync` (with `PINECONE_API_KEY` set, local state store) completes cleanly, hybrid vectors visible in Pinecone console.
+- `anchor serve` + MCP Inspector: `search` returns results with both dense and sparse contributing.
+- ruff + pyright clean.
+
+---
+
+# Sprint 8 — Cloud deployment: transport + OAuth + Docker + CI/CD  [SONNET] [~28k tokens]
+
+**Goal**: the full Cloud Run deployment. StreamableHTTP transport, Google-OAuth-based user auth (Claude Desktop does the auth dance — no manual token management), Dockerfile, and a single `cloudbuild.yaml` that builds + deploys on push to main.
+
+## Pre-thinking checklist
+- [ ] The MCP spec defines OAuth 2.0 for remote servers. Claude Desktop handles the dance automatically when it discovers `/.well-known/oauth-authorization-server`. The server must implement: discovery, `/oauth/authorize`, `/oauth/callback`, `/oauth/token`.
+- [ ] Google is the upstream identity provider. Users sign in with their Google account. The server gets their email from Google's userinfo endpoint, checks it against the GCS allowlist, and issues its own short-lived JWT.
+- [ ] The JWT is symmetric (HS256), signed with `JWT_SECRET` from Secret Manager. Claims: `sub` (email), `role` (reader/admin), `exp` (24h), `iat`.
+- [ ] Drive auth uses a Service Account, not user OAuth. Admin shares their Drive folder with the service account email. Service account JSON is stored in Secret Manager as `GOOGLE_SERVICE_ACCOUNT_KEY`.
+- [ ] `--allow-unauthenticated` on Cloud Run means Cloud Run itself does not check auth — the MCP server does. This is correct: MCP auth lives at the application layer.
+- [ ] Local stdio mode must still work for dev. The `serve` command gains a `--local` flag that uses stdio transport and skips JWT validation.
+
+## Implementation steps
+
+### 8-A: JWT middleware
+1. Create `src/anchor_mcp/auth_middleware.py`:
+   - `decode_jwt(token: str) -> JWTClaims` — validates signature, expiry; raises `AuthError` on failure.
+   - `JWTClaims` pydantic model: `sub: str` (email), `role: Literal["reader", "admin"]`, `exp: int`.
+   - `require_role(role)` decorator for tool functions: reads JWT from FastMCP request context, raises `AuthError` with 403 if wrong role.
+2. Apply `@require_role("admin")` to `sync_drive` and `add_note` tools in `server.py`.
+3. All other tools: require valid JWT of any role (reader or admin).
+
+### 8-B: OAuth endpoints
+1. Add to `server.py` (or a separate `auth_routes.py` mounted on the same app):
+   - `GET /.well-known/oauth-authorization-server` — static JSON per MCP OAuth spec:
+     ```json
+     {
+       "issuer": "https://{CLOUD_RUN_URL}",
+       "authorization_endpoint": "https://{CLOUD_RUN_URL}/oauth/authorize",
+       "token_endpoint": "https://{CLOUD_RUN_URL}/oauth/token",
+       "response_types_supported": ["code"],
+       "grant_types_supported": ["authorization_code"]
+     }
+     ```
+   - `GET /oauth/authorize?client_id=&redirect_uri=&state=&code_challenge=` — validates params, redirects to `accounts.google.com/o/oauth2/auth` with the server's Google OAuth client ID and `{CLOUD_RUN_URL}/oauth/callback` as redirect URI. Stores `state` in a short-lived in-memory or GCS-backed session.
+   - `GET /oauth/callback?code=&state=` — exchanges code with Google for user's email via userinfo endpoint. Checks email against GCS allowlist. Generates a PKCE auth code (short-lived, single-use). Redirects to the original `redirect_uri` with the code.
+   - `POST /oauth/token` — exchanges PKCE auth code for a signed JWT. Returns `access_token` (JWT), `token_type: "Bearer"`, `expires_in: 86400`.
+   - `GET /health` — 200 OK, no auth required. Used by Cloud Build smoke test.
+   - `POST /admin/users` — admin JWT required. Body: `{"email": "x@y.com", "role": "reader"}`. Reads + rewrites `allowlist.json` in GCS.
+   - `DELETE /admin/users/{email}` — admin JWT required. Removes from allowlist.
+2. Store Google OAuth client ID/secret as env vars from Secret Manager. No hardcoding.
+
+### 8-C: Service Account for Drive
+1. Update `auth.py`:
+   - Add `load_service_account_credentials() -> google.oauth2.service_account.Credentials`.
+   - Reads `GOOGLE_SERVICE_ACCOUNT_KEY` env var (JSON string from Secret Manager).
+   - Scope: `https://www.googleapis.com/auth/drive.readonly`.
+2. Update `server.py` `_ensure_initialized()`: use `load_service_account_credentials()` when `GOOGLE_SERVICE_ACCOUNT_KEY` is set; fall back to `load_credentials()` (OAuth token file) otherwise.
+   This means: local dev still works with the OAuth token. Cloud Run uses the service account. No code path change needed for tools.
+3. Keep `auth.py`'s existing OAuth flow for local dev. It is NOT removed.
+
+### 8-D: Transport switch
+1. Update `cli.py` `serve` command:
+   - Add `--local` flag. Default is HTTP.
+   - `--local`: uses `mcp.run(transport="stdio")` (existing behaviour, keeps Claude Code working).
+   - Without `--local`: uses `mcp.run(transport="streamable-http", host="0.0.0.0", port=8080)`.
+2. Update `claude_desktop_config.json` example in README:
+   ```json
+   {
+     "mcpServers": {
+       "anchor": { "url": "https://anchor-xyz-uc.a.run.app" }
+     }
+   }
    ```
-   anchor-mcp/
-     README.md
-     LICENSE                # MIT
-     pyproject.toml         # uv-managed
-     ruff.toml
-     pyrightconfig.json
-     .gitignore             # incl. .anchor/, *.json oauth tokens, __pycache__
-     .env.example
-     src/anchor_mcp/
-       __init__.py          # __version__ = "0.1.0"
-       __main__.py          # CLI entrypoint
-     tests/
-       __init__.py
-     docs/
-       ARCHITECTURE.md      # stub, populated in Sprint 8
-       DESIGN.md            # stub with "Future Work: multi-tenant ACL mirroring" section
-       BACKLOG.md           # empty
-       SPRINT_NOTES.md      # empty
-   ```
-2. Write `pyproject.toml` with all locked deps under `[project.dependencies]`, Pinecone under `[project.optional-dependencies].pinecone`, dev deps under `dev`.
-3. Write `README.md` covering:
-   - One-line tagline
-   - The problem (3 sentences max — meeting transcripts + notes + docs scattered in Drive, LLMs hallucinate, Glean is enterprise-only)
-   - What Anchor does (bullet list of the 6 MCP tools with one-line descriptions each)
-   - Quickstart (install via pip, `anchor init`, OAuth flow, config in Claude Desktop)
-   - Architecture diagram (use the ASCII diagram above)
-   - Configuration (env vars: `OPENROUTER_API_KEY`, `ANCHOR_VECTOR_BACKEND`, `ANCHOR_DRIVE_FOLDER_ID`, optional `PINECONE_API_KEY`)
-   - Supported file types (PDF text-copyable, .txt, .md, Google Docs, Google Meet transcripts; explicit "not supported in v1" list)
-   - Demo section (link placeholder for Loom — leave as `[Loom link: TBA]`)
-   - Limitations and honest scope (single-user, append-only vector store, multi-tenant ACL is future work, OCR is future work)
-   - Future work (link to `docs/DESIGN.md`)
-   - License
-4. Write `LICENSE` (MIT, Atharva as copyright holder).
-5. Write `.env.example` with every required and optional env var, commented.
-6. Initialize git repo, first commit `sprint-0: project skeleton and README`.
-
-## Anti-patterns (refuse)
-- Do NOT write any actual Python implementation in this sprint. The `__main__.py` is a stub that prints "Anchor v0.1.0 — not yet implemented." That's it.
-- Do NOT add CI/CD, Docker, Cloud Run configs, or GitHub Actions in this sprint.
-- Do NOT add a logo, badges, or marketing fluff to the README. Plain, technical, defensible.
-- Do NOT promise features not in the locked scope (no "multi-user support," no "OCR," no "ChatGPT compatibility").
-
-## Acceptance criteria
-- `pip install -e .` succeeds in a fresh venv.
-- `python -m anchor_mcp` prints the stub message and exits cleanly.
-- `ruff check` and `pyright` both pass on the empty skeleton.
-- README renders cleanly on GitHub (Atharva eyeballs it).
-- Atharva can copy-paste a CV bullet from the README without embarrassment.
-
-## CV bullet generated by this sprint
-> "Designed and shipped `anchor-mcp`, a local-first Model Context Protocol server that grounds LLMs (Claude, Cursor, any MCP-compatible client) in a user's Google Drive corpus. Source-cited retrieval, BYOK faithfulness verification, multilingual embeddings via bge-m3. Python 3.11, FastMCP, ChromaDB / Pinecone."
-
----
-
-# Sprint 1 — Configuration, CLI, and state directory  [SONNET] [~15k tokens]
-
-**Goal**: a working `anchor init` and `anchor config` CLI that bootstraps `~/.anchor/`, validates env vars, and stores a typed config the rest of the codebase reads from.
-
-## Pre-thinking checklist
-- [ ] All config is pydantic-validated. No raw dict access elsewhere in the codebase.
-- [ ] `~/.anchor/` must respect `XDG_CONFIG_HOME` if set (Linux convention).
-- [ ] Decide config file format: JSON (for human-readability) — not TOML, not YAML.
-
-## Implementation steps
-1. Create `src/anchor_mcp/config.py`:
-   - `AnchorConfig` pydantic model with fields: `drive_folder_id`, `vector_backend` (Literal["chroma", "pinecone"]), `embedding_model` (default "BAAI/bge-m3"), `judge_model` (default "anthropic/claude-haiku-4-5"), `chunk_size` (default 800), `chunk_overlap` (default 100), `state_dir` (Path).
-   - `load_config()` reads `~/.anchor/config.json`, returns `AnchorConfig`. Raises `ConfigNotFoundError` with a helpful message if missing.
-   - `save_config(cfg)` writes atomically (write to tmp, rename).
-2. Create `src/anchor_mcp/cli.py` using Click:
-   - `anchor init` — interactive prompt for Drive folder ID, asks for backend choice (default chroma), validates `OPENROUTER_API_KEY` env var is set, creates `~/.anchor/` tree, writes initial config.
-   - `anchor config show` — prints current config (redacts secrets).
-   - `anchor config set <key> <value>` — updates one field, re-validates.
-   - `anchor doctor` — runs sanity checks: state dir exists, config valid, `OPENROUTER_API_KEY` set, OAuth token present (just check file exists; don't validate it yet — that's Sprint 2).
-3. Wire `cli.py` into `__main__.py` so `python -m anchor_mcp` and `anchor` (via entrypoint in pyproject) both work.
-4. Add `anchor_mcp.errors` module with custom exceptions: `ConfigNotFoundError`, `AuthError`, `SyncError`, `BackendError`.
-5. Unit tests for config load/save round-trip, atomic write behavior, CLI smoke tests via Click's `CliRunner`.
-
-## Anti-patterns (refuse)
-- No global mutable state. Config is loaded per-call or injected.
-- No `os.environ` reads outside `config.py` and a single `secrets.py` module that wraps env access.
-- No "fallback to defaults if config is malformed" — fail loudly with a clear error.
-
-## Acceptance criteria
-- `anchor init` in a fresh home directory produces a valid `~/.anchor/config.json`.
-- `anchor doctor` reports all green when env is set up correctly, red with specific remediation when not.
-- Tests pass, ruff + pyright clean.
-
----
-
-# Sprint 2 — Google Drive OAuth and file enumeration  [SONNET] [~20k tokens]
-
-**Goal**: OAuth flow that gets a refresh token, stores it encrypted, and a `DriveClient` that lists + downloads files from the configured folder (recursively).
-
-## Pre-thinking checklist
-- [ ] Atharva has a GCP project and OAuth credentials JSON from Food Explorer experience — assume he can produce one. README documents how.
-- [ ] Token encryption at rest: use `cryptography.fernet` with a key derived from a machine-local secret (e.g., a generated key stored at `~/.anchor/.key` with 0600 perms). Not Fort-Knox, but better than plaintext.
-- [ ] OAuth scope: `https://www.googleapis.com/auth/drive.readonly`. Read-only. We never write to Drive.
-
-## Implementation steps
-1. Create `src/anchor_mcp/auth.py`:
-   - `run_oauth_flow(credentials_json_path)` — runs `InstalledAppFlow` with local redirect (port 0, auto-picked), saves token encrypted.
-   - `load_credentials()` — loads encrypted token, refreshes if expired, returns `google.oauth2.credentials.Credentials`.
-   - `is_authenticated()` — boolean check.
-2. Add `anchor auth login --credentials <path>` CLI command that calls `run_oauth_flow`.
-3. Add `anchor auth status` that calls `is_authenticated()` and reports.
-4. Create `src/anchor_mcp/drive.py`:
-   - `DriveClient` class wrapping `googleapiclient.discovery.build("drive", "v3", credentials=...)`.
-   - `list_files(folder_id: str, recursive: bool = True) -> list[DriveFile]` — paginated, returns `DriveFile` pydantic model with `id, name, mime_type, modified_time, parents, web_view_link, md5_checksum`.
-   - `download_file(file_id, mime_type) -> bytes` — handles Google Docs export (export as `text/plain` for v1; we don't preserve formatting in v1), PDFs and other binaries via `get_media`.
-   - Rate-limit handling: retry with exponential backoff on 429/5xx using `tenacity` or hand-rolled. 5 retries max.
-5. Mock-based unit tests for `DriveClient` using `unittest.mock`. No live API calls in tests.
-
-## Anti-patterns (refuse)
-- Do NOT use a service account. Installed-app OAuth only for v1.
-- Do NOT request broader scopes "in case we need them later." `drive.readonly` only.
-- Do NOT store the OAuth client secret in code. It's loaded from the user's `credentials.json` path.
-- Do NOT swallow Google API errors silently. Wrap into `AuthError` or `SyncError` with the original as `__cause__`.
-
-## Acceptance criteria
-- `anchor auth login --credentials creds.json` opens browser, completes OAuth, writes encrypted token.
-- `anchor auth status` reports authenticated.
-- Manual smoke test: in a Python REPL, `DriveClient.list_files(<atharva_test_folder>)` returns the expected files. (Document this manual check in `SPRINT_NOTES.md`.)
-
----
-
-# Sprint 3 — Text extraction and chunking  [SONNET] [~15k tokens]
-
-**Goal**: a pure-function pipeline that takes a `DriveFile` + raw bytes and produces a list of `Chunk` objects ready for embedding.
-
-## Pre-thinking checklist
-- [ ] This is mostly boring deterministic work. Pure functions, easy to test.
-- [ ] Chunk size 800 tokens, overlap 100. Use `tiktoken` for token counting (cl100k_base is fine as a proxy).
-- [ ] One file → many chunks. Each chunk gets full metadata for citation.
-
-## Implementation steps
-1. Create `src/anchor_mcp/extract.py`:
-   - `extract_text(file: DriveFile, raw_bytes: bytes) -> str` — dispatches on `mime_type`:
-     - `application/pdf` → pypdf, raise `ExtractError` if no text (scanned PDF detection)
-     - `text/plain`, `text/markdown` → decode utf-8
-     - `application/vnd.google-apps.document` → already text-plain after export in Sprint 2
-     - Anything else → raise `UnsupportedMimeTypeError`
-2. Create `src/anchor_mcp/chunk.py`:
-   - `Chunk` pydantic model: `id` (deterministic hash of file_id + chunk_index + text), `text`, `file_id`, `file_name`, `chunk_index`, `token_count`, `modified_time`, `source_url`.
-   - `chunk_text(text: str, file: DriveFile, chunk_size: int, overlap: int) -> list[Chunk]` — recursive character splitter on `\n\n`, `\n`, `. `, ` `, then character-level if needed. Token-counted, not char-counted.
-3. Tests:
-   - Round-trip: extract text from a fixture PDF, chunk it, verify chunk count + overlap math.
-   - `Chunk.id` is deterministic across runs.
-   - Unsupported MIME raises the right error.
-
-## Anti-patterns (refuse)
-- No "semantic chunking" via embeddings or LLM. Recursive character splitter only.
-- No OCR. Scanned PDF = `ExtractError`. Documented limitation.
-- No silent encoding fallbacks. UTF-8 only; on failure, raise.
-
-## Acceptance criteria
-- All file types in the supported list extract + chunk cleanly on real samples.
-- 100% type coverage for `chunk.py` and `extract.py`.
-
----
-
-# Sprint 4 — Vector backend abstraction + embedding  [SONNET] [~20k tokens]
-
-**Goal**: a clean abstraction over ChromaDB (default) and Pinecone (optional), plus the embedding pipeline using bge-m3.
-
-## Pre-thinking checklist
-- [ ] bge-m3 via `sentence-transformers` — first run will download ~2GB to HuggingFace cache. Document this in README and surface a progress bar via the CLI.
-- [ ] Embedding dimension is 1024 for bge-m3. Hard-code as a constant; document.
-- [ ] The backend interface is small: `upsert(chunks, embeddings)`, `query(embedding, top_k, filter)`, `delete(chunk_ids)`, `list_sources()`, `count()`.
-
-## Implementation steps
-1. Create `src/anchor_mcp/embed.py`:
-   - `Embedder` class with lazy-loaded `SentenceTransformer("BAAI/bge-m3")`.
-   - `embed_chunks(chunks: list[Chunk]) -> list[list[float]]` — batched (batch_size=32), returns dense vectors. Normalize for cosine sim.
-   - `embed_query(text: str) -> list[float]` — single query.
-2. Create `src/anchor_mcp/backends/base.py`:
-   - `VectorBackend` Protocol with the 5 methods above. Use pydantic models for inputs/outputs, no dicts.
-3. Create `src/anchor_mcp/backends/chroma_backend.py`:
-   - `ChromaBackend` using `chromadb.PersistentClient(path=state_dir / "chroma")`.
-   - Single collection `"anchor"`.
-   - Stores: embedding, document (chunk.text), metadata (everything else).
-4. Create `src/anchor_mcp/backends/pinecone_backend.py`:
-   - `PineconeBackend` — only imported if `pinecone-client` is installed.
-   - Reads `PINECONE_API_KEY`, `PINECONE_INDEX_NAME` from env.
-   - Asserts index dimension matches embedder dimension on first use; raises clear error if not.
-5. Create `src/anchor_mcp/backends/__init__.py` with `get_backend(config) -> VectorBackend` factory.
-6. Tests:
-   - In-memory Chroma round-trip: upsert 3 chunks, query, verify top-1 match.
-   - Pinecone test is skipped unless `PINECONE_API_KEY` is set (`pytest.mark.skipif`).
-
-## Anti-patterns (refuse)
-- No support for "other" backends in v1. Two is enough.
-- No re-ranking layer. v1 is single-stage dense retrieval.
-- No background re-indexing. Embeddings are computed on `sync_drive` only.
-
-## Acceptance criteria
-- A fresh ChromaDB collection can be created, populated with 10+ chunks, queried, and returns sensible nearest neighbors.
-- Switching `ANCHOR_VECTOR_BACKEND=pinecone` (with key set) routes through Pinecone with no other code changes.
-
----
-
-# Sprint 5 — Sync engine  [SONNET] [~20k tokens]
-
-**Goal**: the `sync_drive` flow that detects new/modified/deleted files, pipes them through extract → chunk → embed → upsert, and updates a local sync state.
-
-## Pre-thinking checklist
-- [ ] Sync state at `~/.anchor/cache/sync_state.json`: `{file_id: {modified_time, md5_checksum, chunk_ids: [...]}}`.
-- [ ] **Append-only at the vector level, but we must handle file changes.** Decision: when a file's `modified_time` changes, delete its old chunks (using stored `chunk_ids`) and insert new ones. This isn't "editing a vector," it's "re-indexing a source document." That's a defensible distinction — document it in DESIGN.md.
-- [ ] **Deletions:** if a file is no longer in Drive, its chunks are deleted from the vector store. (Otherwise stale knowledge accumulates forever.) Document.
-- [ ] User-initiated `add_note` content (Sprint 7) is *not* touched by sync — it's a separate logical namespace.
-
-## Implementation steps
-1. Create `src/anchor_mcp/sync.py`:
-   - `SyncState` pydantic model + JSON persistence helpers.
-   - `Syncer` class with `__init__(drive, embedder, backend, state)`.
-   - `sync(folder_id: str, progress_cb: Callable | None = None) -> SyncReport` where `SyncReport = {added, updated, deleted, skipped, errors}`.
-   - Diff algorithm:
-     1. List files in folder via `DriveClient`.
-     2. For each: if `file_id not in state` → ADD. If `state[file_id].modified_time < drive_modified` → UPDATE. Else SKIP.
-     3. For each `file_id in state` but not in Drive → DELETE.
-   - Errors per-file don't abort the sync; collected in `SyncReport.errors`.
-2. Add `anchor sync` CLI command that runs the sync and prints the report.
-3. Tests with mocked Drive + Chroma:
-   - First sync (cold): all files added.
-   - Second sync (no changes): all skipped.
-   - File modified: 1 update, old chunks gone, new chunks present.
-   - File deleted from Drive: chunks removed from backend.
-
-## Anti-patterns (refuse)
-- No partial-sync resume on failure mid-sprint. If sync crashes, next run starts over for un-finished files (since state is only updated post-success per file). Document this.
-- No webhooks, no polling daemon. Manual `anchor sync` only.
-- No "smart" diff that tries to chunk-level diff documents. Whole-file re-index on change. Simpler and correct.
-
-## Acceptance criteria
-- Full cold sync of a 20-file fixture folder completes without errors and reports correct counts.
-- Modifying one file and re-syncing produces exactly 1 update, with old chunks gone.
-
----
-
-# Sprint 6 — MCP server: read tools  [OPUS] [~20k tokens]
-
-**Goal**: the FastMCP server exposing `search`, `get_document`, `list_sources`, and `sync_drive` as MCP tools. **Marked Opus** because the tool schemas, descriptions, and citation contract are the user-facing API — these need to be tight, clear, and resistant to misuse by an LLM caller.
-
-## Pre-thinking checklist
-- [ ] Tool descriptions are the *prompt* the LLM sees to decide when to call. They must be specific, with examples. This is the highest-leverage prose in the codebase.
-- [ ] Every search result includes structured citation metadata. The LLM will be instructed (via tool descriptions) to cite these explicitly.
-- [ ] No `stdout` logging in stdio mode — it corrupts the MCP transport. All logs to file or stderr.
-
-## Implementation steps
-1. Create `src/anchor_mcp/server.py`:
-   - Initialize FastMCP server `mcp = FastMCP("anchor")`.
-   - Tool: `search(query: str, top_k: int = 5, file_name_filter: str | None = None) -> list[SearchResult]`. `SearchResult` includes `text, file_name, file_id, chunk_index, source_url, relevance_score, modified_time`.
-   - Tool: `get_document(file_id: str) -> DocumentView` — returns full text of a file (re-assembled from chunks), with metadata.
-   - Tool: `list_sources(name_filter: str | None = None) -> list[SourceSummary]` — lists all indexed files with chunk counts.
-   - Tool: `sync_drive() -> SyncReport` — triggers a sync, returns the report.
-2. **Tool descriptions** — written carefully, with explicit instruction to the LLM:
-   - `search`: "Search the user's Google Drive knowledge base by semantic similarity. Returns up to `top_k` chunks of text with full source metadata. **You MUST cite results using the format `[file_name, chunk N](source_url)` when using information from them.** If results have low relevance scores (< 0.5), state that the answer may not be in the user's documents."
-   - `get_document`: "Retrieve the full reconstructed text of a single document by its `file_id`. Use this when `search` returned a useful snippet and you need broader context from the same file."
-   - `list_sources`: "Enumerate documents available in the user's indexed Drive folder. Useful when the user asks 'what do you have access to?' or wants to know if a specific document is indexed."
-   - `sync_drive`: "Re-sync the user's Drive folder, picking up new, modified, and deleted files. **Only call this when the user explicitly asks to refresh / sync / update / re-index.** Returns a summary of changes."
-3. Configure logging to write to `~/.anchor/logs/anchor.log` with rotation. Stderr for warnings only. Stdout is reserved for MCP transport.
-4. Add `anchor serve` CLI command that starts the FastMCP stdio server.
-5. Write a `claude_desktop_config.json` example block in README:
+   Claude Desktop handles the OAuth dance automatically when it sees the URL.
+3. Keep local config block in README for dev:
    ```json
    {
      "mcpServers": {
        "anchor": {
-         "command": "anchor",
-         "args": ["serve"],
-         "env": { "OPENROUTER_API_KEY": "sk-or-..." }
+         "command": "anchor", "args": ["serve", "--local"],
+         "env": { "PINECONE_API_KEY": "..." }
        }
      }
    }
    ```
-6. Tests:
-   - `mcp dev` (the FastMCP dev runner) loads the server without error.
-   - Each tool callable with valid inputs returns the expected pydantic-serialized response.
-   - `search` against a fixture-populated Chroma returns ranked results.
+
+### 8-E: Dockerfile
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY pyproject.toml .
+COPY src/ src/
+RUN pip install --no-cache-dir -e .
+EXPOSE 8080
+CMD ["anchor", "serve"]
+```
+No sentence-transformers. No torch. No CUDA. Build time < 2 minutes. Image < 100MB.
+
+### 8-F: cloudbuild.yaml
+```yaml
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, -t, gcr.io/$PROJECT_ID/anchor-mcp:$SHORT_SHA, .]
+
+  - name: gcr.io/cloud-builders/docker
+    args: [push, gcr.io/$PROJECT_ID/anchor-mcp:$SHORT_SHA]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run deploy anchor-mcp
+      - --image=gcr.io/$PROJECT_ID/anchor-mcp:$SHORT_SHA
+      - --region=us-central1
+      - --service-account=anchor-sa@$PROJECT_ID.iam.gserviceaccount.com
+      - --allow-unauthenticated
+      - --set-secrets=PINECONE_API_KEY=PINECONE_API_KEY:latest,OPENROUTER_API_KEY=OPENROUTER_API_KEY:latest,GOOGLE_SERVICE_ACCOUNT_KEY=GOOGLE_SERVICE_ACCOUNT_KEY:latest,GOOGLE_OAUTH_CLIENT_ID=GOOGLE_OAUTH_CLIENT_ID:latest,GOOGLE_OAUTH_CLIENT_SECRET=GOOGLE_OAUTH_CLIENT_SECRET:latest,JWT_SECRET=JWT_SECRET:latest
+      - --set-env-vars=GCS_BUCKET=anchor-$PROJECT_ID-state
+      - --port=8080
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - curl -sf https://$(gcloud run services describe anchor-mcp --region=us-central1 --format='value(status.url)')/health
+
+images:
+  - gcr.io/$PROJECT_ID/anchor-mcp:$SHORT_SHA
+```
+
+### 8-G: GCP setup (one-time, documented as runbook in SPRINT_NOTES.md)
+Run these once before the first deploy:
+```bash
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+  secretmanager.googleapis.com storage.googleapis.com artifactregistry.googleapis.com
+
+# Service account
+gcloud iam service-accounts create anchor-sa \
+  --display-name="Anchor MCP service account"
+
+# Permissions
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:anchor-sa@$PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:anchor-sa@$PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+
+# GCS bucket
+gsutil mb -l us-central1 gs://anchor-$PROJECT_ID-state
+
+# Secrets (populated manually with actual values)
+for secret in PINECONE_API_KEY OPENROUTER_API_KEY GOOGLE_SERVICE_ACCOUNT_KEY \
+              GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET JWT_SECRET; do
+  gcloud secrets create $secret --replication-policy=automatic
+done
+
+# Cloud Build trigger (on push to main)
+gcloud builds triggers create github \
+  --repo-name=anchor --repo-owner=<github-user> \
+  --branch-pattern=^main$ --build-config=cloudbuild.yaml
+```
+
+### 8-H: Tests
+- `decode_jwt` round-trip: issue → decode → assert claims match.
+- `decode_jwt` rejects expired token.
+- `decode_jwt` rejects wrong signature.
+- Mock the allowlist GCS read; verify `require_role("admin")` blocks readers.
+- OAuth callback: mock Google userinfo response; verify JWT is issued for allowlisted email; verify 403 for non-allowlisted email.
+- Health endpoint: 200, no auth.
 
 ## Anti-patterns (refuse)
-- Do NOT log to stdout. This breaks MCP stdio transport. All logs go to file or stderr.
-- Do NOT skip the explicit citation instruction in tool descriptions — that's the entire faithfulness story for read tools.
-- Do NOT add tools beyond the four listed. `add_note` and `verify_claim` are Sprint 7.
+- Do NOT put any secret value in `cloudbuild.yaml` or the Dockerfile. Secrets come from Secret Manager at deploy time.
+- Do NOT validate JWTs in the OAuth endpoints themselves (those are pre-auth paths). Only tool handlers check the JWT.
+- Do NOT use Cloud Run's built-in auth (`--no-allow-unauthenticated`). The MCP spec requires the server to handle auth at the application layer.
+- Do NOT remove the `--local` flag or break the stdio path. Local dev must stay intact.
 
 ## Acceptance criteria
-- Server starts cleanly via `anchor serve` and via Claude Desktop launch.
-- All four tools are visible and callable via MCP Inspector.
-- Atharva runs end-to-end: opens Claude Desktop, asks "what's in my ISB Strategy folder?" and gets a cited answer.
+- `docker build` produces an image under 120MB.
+- `cloudbuild.yaml` triggered by push to main builds, pushes, and deploys without manual steps.
+- Health endpoint at Cloud Run URL returns 200.
+- User opens Claude Desktop, adds the Cloud Run URL as an MCP server, is redirected to Google login, signs in, and can call `list_sources` successfully.
+- Admin user can call `sync_drive`; reader gets 403 on the same call.
+- `anchor serve --local` still works for local dev via stdio.
 
 ---
 
-# Sprint 7 — MCP server: write tools (`add_note`, `verify_claim`)  [OPUS] [~18k tokens]
+# Sprint 9 — Write tools: `add_note` + `verify_claim`  [OPUS] [~20k tokens]
 
-**Goal**: append-only knowledge capture and BYOK faithfulness verification. **Marked Opus** because `verify_claim`'s judge prompt is the second-highest-leverage prompt in the codebase — get it wrong and the tool produces confident-sounding wrong classifications.
+**Goal**: append-only knowledge capture and server-side faithfulness verification. **Marked Opus** because the judge prompt is the highest-leverage prose in the codebase — a bad prompt produces confident-sounding misclassifications.
+
+Note: These tools now run server-side on Cloud Run. `add_note` is admin-only (shared KB, not per-user). `verify_claim` is available to all roles.
 
 ## Pre-thinking checklist
-- [ ] `add_note` writes a markdown file to `~/.anchor/notes/` AND ingests it into the vector store, namespaced with `source_type: "user_note"` so it's distinguishable from Drive content.
-- [ ] `verify_claim` calls OpenRouter directly via httpx. No SDK dependency. Single POST, parse JSON response.
-- [ ] If `OPENROUTER_API_KEY` is not set, `verify_claim` is **not registered** as an MCP tool. Server still starts; the tool simply doesn't exist for the LLM. Document this clearly.
-- [ ] The judge prompt must be carefully written: it sees `(claim, evidence_chunks)` and must output structured JSON `{verdict: "supported"|"partially_supported"|"not_supported", rationale: str, evaluated_chunk_ids: [...]}`. Few-shot the verdict criteria.
+- [ ] `add_note` writes to GCS (`notes/{timestamp}_{slug}.md`) AND upserts to Pinecone with `source_type: "user_note"` metadata. The note is immediately searchable.
+- [ ] `verify_claim` calls OpenRouter via httpx. No SDK. Single POST. Parse strict JSON.
+- [ ] If `OPENROUTER_API_KEY` is not set, `verify_claim` is NOT registered as a tool. Server starts; tool simply doesn't exist. Document this.
+- [ ] `add_note` requires admin role (role check via JWT middleware from Sprint 8). Rationale: it permanently modifies the shared knowledge base.
+- [ ] The judge prompt must output strict JSON. If OpenRouter returns malformed JSON, retry once with "Your last response was not valid JSON. Return only the JSON object." If second attempt also fails, raise `VerificationError`.
 
 ## Implementation steps
 1. Add `add_note` tool to `server.py`:
    - Signature: `add_note(content: str, title: str, tags: list[str] = []) -> NoteReceipt`.
-   - Writes `~/.anchor/notes/{timestamp}_{slug(title)}.md` with frontmatter (title, tags, created_at).
-   - Chunks + embeds + upserts to backend with `source_type: "user_note"`.
-   - Tool description includes: "**This appends a permanent note to the user's knowledge base. Only call this when the user explicitly says 'remember this,' 'save this,' 'add a note,' or similar.** The note becomes searchable immediately."
+   - `@require_role("admin")` decorator.
+   - Writes `notes/{timestamp}_{slug(title)}.md` to GCS via `_state_store`.
+   - Generates hybrid embeddings via `_embedder`, upserts to Pinecone with `source_type: "user_note"` in metadata.
+   - Updates `file_registry.json` with the note as a new "file."
+   - `NoteReceipt`: `note_id: str`, `title: str`, `chunk_count: int`, `stored_at: str`.
+   - Tool description: "**This permanently appends a note to the shared knowledge base. Only call this when the user explicitly says 'remember this,' 'save this,' 'add a note about,' or similar. Admin access required.** The note is immediately searchable by all users."
 2. Create `src/anchor_mcp/judge.py`:
-   - `OpenRouterJudge` class.
-   - Prompt template stored as a constant (single source of truth, no string templating across files):
+   - `OpenRouterJudge(api_key: str, model: str)`.
+   - Judge prompt (stored as module-level constant — single source of truth):
      ```
-     You are a strict faithfulness judge. Given a CLAIM and a set of EVIDENCE chunks from a knowledge base, determine whether the claim is supported.
+     You are a strict faithfulness judge evaluating whether a CLAIM is supported
+     by retrieved EVIDENCE from a knowledge base.
 
-     Return verdict from {supported, partially_supported, not_supported}:
-     - supported: every factual assertion in the claim is directly stated in the evidence
-     - partially_supported: some assertions are in the evidence, others are not present (or contradicted)
-     - not_supported: the claim's key assertions are not present in the evidence (or are contradicted)
+     Verdicts:
+     - supported: every factual assertion in the claim is directly stated in the evidence.
+     - partially_supported: some assertions are in the evidence; others are absent or contradicted.
+     - not_supported: the claim's key assertions are absent from or contradicted by the evidence.
 
-     Output strict JSON only:
-     {"verdict": "...", "rationale": "<1-2 sentences>", "evaluated_chunk_ids": [...]}
+     Output ONLY valid JSON, no explanation outside the JSON:
+     {"verdict": "supported|partially_supported|not_supported",
+      "rationale": "<1-2 sentences>",
+      "evaluated_chunk_ids": ["id1", "id2"]}
 
      CLAIM: {claim}
 
      EVIDENCE:
      {evidence_block}
      ```
-   - `verify(claim: str, chunk_ids: list[str]) -> VerifyResult`. Loads chunk texts from backend by ID, builds evidence block, posts to OpenRouter, parses strict JSON (use json.loads with strict mode; reject if not valid JSON; retry once with a "Your last response was not valid JSON, try again" follow-up).
-3. Add `verify_claim` tool to `server.py` — registered conditionally on `OPENROUTER_API_KEY` presence. Tool description:
-   > "Verify whether a factual claim is supported by specific evidence chunks from the user's knowledge base. Use this after making a substantive claim based on `search` results. Pass the claim text and the `chunk_id` values from the search results you used. Returns a verdict: supported / partially_supported / not_supported, with rationale. If verdict is not 'supported', you MUST tell the user your claim could not be fully verified against their documents."
+   - `verify(claim: str, chunk_ids: list[str], backend: VectorBackend) -> VerifyResult`.
+   - `VerifyResult`: `verdict: Literal["supported", "partially_supported", "not_supported"]`, `rationale: str`, `evaluated_chunk_ids: list[str]`.
+3. Register `verify_claim` tool conditionally (only if `OPENROUTER_API_KEY` is set):
+   - Signature: `verify_claim(claim: str, chunk_ids: list[str]) -> VerifyResult`.
+   - Tool description: "Verify whether a factual claim is supported by specific evidence chunks from the knowledge base. Call this after making a substantive claim based on `search` results. Pass the claim and the `chunk_id` values from the search results you used. If verdict is not 'supported', you MUST tell the user your claim could not be fully verified against their documents."
 4. Tests:
-   - `add_note` round-trip: call tool, verify file written, verify chunk searchable.
-   - `judge.verify` with mocked OpenRouter response for each verdict type.
-   - Judge handles malformed JSON gracefully (retries once, then errors).
+   - `add_note` round-trip: mock GCS + Pinecone. Verify GCS write called, Pinecone upsert called with correct metadata, registry updated.
+   - `judge.verify` with mocked OpenRouter for each verdict type.
+   - Judge handles malformed JSON (retries once).
+   - `verify_claim` not registered when env var absent.
 
 ## Anti-patterns (refuse)
-- Do NOT call OpenRouter from any other module. All judge logic in `judge.py`.
-- Do NOT expand `verify_claim` to do retrieval itself ("verify this claim against my whole drive"). It only operates on chunks the LLM already retrieved. Keeps the contract small.
-- Do NOT add a "score" or "confidence percentage" to the judge output. Three-state verdict + rationale only. Probabilistic scores from LLM judges are noise; don't pretend otherwise.
+- Do NOT let `verify_claim` do its own retrieval. It only operates on chunks the LLM already retrieved. Contract stays small.
+- Do NOT add a numeric confidence score. Three-state verdict + rationale only. LLM confidence scores are noise.
+- Do NOT call OpenRouter from any module other than `judge.py`.
+- Do NOT make `add_note` available to readers. Role check is mandatory.
 
 ## Acceptance criteria
-- `add_note` called with a fixture note appears in `list_sources` after the call, and surfaces in `search`.
-- `verify_claim` with a supported claim returns `supported`; with a fabricated claim returns `not_supported`. Atharva manually runs both cases through Claude Desktop and documents in `SPRINT_NOTES.md`.
+- Admin calls `add_note` → note appears in `list_sources` and surfaces in `search` within the same server session.
+- `verify_claim` with a claim directly from a retrieved chunk returns `supported`.
+- `verify_claim` with a fabricated claim returns `not_supported`.
+- Atharva manually runs both through Claude Desktop and documents in `SPRINT_NOTES.md`.
 
 ---
 
-# Sprint 8 — Hardening, docs, demo  [SONNET] [~18k tokens]
+# Sprint 10 — Hardening, docs, demo  [SONNET] [~18k tokens]
 
-**Goal**: production-quality polish, complete docs, and a recorded Loom demo. This is the sprint that converts a working tool into a CV-worthy artifact.
-
-## Pre-thinking checklist
-- [ ] The README written in Sprint 0 may be out of sync with shipped reality. Reconcile.
-- [ ] DESIGN.md gets the real version with all the decision rationale.
-- [ ] One full end-to-end demo run on the ISB coursework + fabricated Meet transcripts.
+**Goal**: production-quality polish, reconciled documentation, and a recorded demo. Converts a working system into a CV-worthy, recruiter-shippable artifact.
 
 ## Implementation steps
-1. Read Sprint 0's README. Diff against current capabilities. Update anything that drifted. Add Loom link.
-2. Write `docs/ARCHITECTURE.md`:
-   - The diagram from this plan.
-   - Module-by-module: what lives where and why.
-   - Data flow: ingestion path, query path, verification path.
-3. Write `docs/DESIGN.md`:
-   - **Decision log**: stdio vs HTTP, append-only with re-index on change, single-user, no OCR, no semantic chunking, openrouter for judge. Each with one paragraph of rationale.
-   - **Future work**: multi-tenant ACL mirroring (with the security argument from our conversation), Streamable HTTP transport for remote/Claude-web use, OCR via Tesseract, polling-based incremental sync, re-ranking layer, observability hooks.
-4. Add a `Makefile` (or `justfile`) with targets: `install`, `lint`, `typecheck`, `test`, `serve`, `sync`, `doctor`.
-5. Add GitHub Actions: `lint + test` on push to main.
-6. Add a `CHANGELOG.md`, populate v0.1.0.
-7. Atharva records Loom (5-7 min): config in Claude Desktop, `anchor sync`, query against ISB content, query against Meet transcript, `verify_claim` flow, `add_note` flow.
-8. Add Loom link to README, commit, tag `v0.1.0`.
-
-## Anti-patterns (refuse)
-- Do NOT add new features in this sprint. Polish only.
-- Do NOT publish to PyPI yet (separate decision, after Atharva eyeballs the final product).
+1. Reconcile README against shipped reality. Update architecture diagram, quickstart (now URL-based), add `OPENROUTER_API_KEY` to env docs, remove ChromaDB references.
+2. Write `docs/ARCHITECTURE.md` — module map, data flow (ingest path, query path, verification path), GCS schema, JWT claims schema.
+3. Write `docs/DESIGN.md` — decision log with rationale for: Pinecone-only (no local DB), Pinecone inference (no local embedder), hybrid search (why dense alone isn't enough for citations), Google OAuth via MCP spec (no manual tokens), service account for Drive (no user-OAuth server-side), OpenRouter for judge (model-agnostic), three-state verdict (no confidence scores), admin-only `add_note` (shared KB ownership).
+4. Update `BACKLOG.md` with: OCR, re-ranking, webhook-based incremental sync, per-user note namespaces, usage analytics, PyPI publish.
+5. Add `Makefile` targets: `install`, `lint`, `typecheck`, `test`, `serve-local`, `deploy`.
+6. Record Loom (5–7 min): add URL to Claude Desktop → Google login → `list_sources` → `search` with citation → `verify_claim` supported → `verify_claim` not_supported → `add_note` → confirm note searchable → `sync_drive` admin demo.
+7. Tag `v0.2.0`. Update CHANGELOG.
 
 ## Acceptance criteria
-- Fresh-clone, fresh-install on a new machine produces a working setup in <10 minutes following only the README.
-- All docs render cleanly.
-- Loom is shippable to a recruiter as-is.
-
----
-
-# Sprint 9 (optional / stretch) — Pinecone deploy + observability  [SONNET] [~12k tokens]
-
-**Goal**: optional polish. Only execute if all prior sprints came in under budget.
-
-- Verify Pinecone backend on Atharva's free-tier index end-to-end.
-- Add basic OpenTelemetry hooks (just spans for `search`, `sync`, `verify_claim`) — local-only exporter for now. Keyword on the CV: observability.
-- Write a blog post draft: "Building a local-first Drive RAG MCP server in 2 weeks."
+- Fresh clone + README → working Cloud Run MCP server in < 15 minutes.
+- All docs render cleanly on GitHub.
+- Loom is shippable to a recruiter without embarrassment.
 
 ---
 
 # Token budget summary
 
-| Sprint | Model | Tokens | Cumulative |
-|---|---|---|---|
-| 0 — README + skeleton | Sonnet | 12k | 12k |
-| 1 — Config + CLI | Sonnet | 15k | 27k |
-| 2 — OAuth + Drive | Sonnet | 20k | 47k |
-| 3 — Extract + chunk | Sonnet | 15k | 62k |
-| 4 — Vector backend + embed | Sonnet | 20k | 82k |
-| 5 — Sync engine | Sonnet | 20k | 102k |
-| 6 — MCP read tools | **Opus** | 20k | 122k |
-| 7 — `add_note` + `verify_claim` | **Opus** | 18k | 140k |
-| 8 — Hardening + docs + demo | Sonnet | 18k | 158k |
-| 9 — Stretch | Sonnet | 12k | 170k |
+| Sprint | Status | Model | Est. tokens |
+|--------|--------|-------|-------------|
+| 0 — README + skeleton | ✅ done | Sonnet | ~12k |
+| 1 — Config + CLI | ✅ done | Sonnet | ~15k |
+| 2 — Drive OAuth | ✅ done | Sonnet | ~20k |
+| 3 — Extract + chunk | ✅ done | Sonnet | ~15k |
+| 4 — Vector backend + embed | ✅ done | Sonnet | ~20k |
+| 5 — Sync engine | ✅ done | Sonnet | ~20k |
+| 6 — MCP read tools | ✅ done | Opus | ~20k |
+| 7 — Pinecone inference + hybrid + GCS | 🔜 next | Sonnet | ~25k |
+| 8 — Cloud deploy + OAuth + Docker + CI | 🔜 | Sonnet | ~28k |
+| 9 — `add_note` + `verify_claim` | 🔜 | **Opus** | ~20k |
+| 10 — Hardening + docs + demo | 🔜 | Sonnet | ~18k |
 
-Two Opus sprints, seven Sonnet. Total target ~158k tokens (170k with stretch). Calendar time ~2 weeks at a comfortable pace.
+Remaining: ~91k tokens across 4 sprints.
 
 ---
 
 # Standing instructions for Atharva between sprints
 
 - After each sprint, **run the project yourself for 5 minutes** before starting the next. Catch drift early.
-- Maintain `BACKLOG.md` with anything Claude Code surfaces as "future work" — don't let it sneak into the current sprint.
-- If a sprint exceeds 1.3x budget, **stop and reassess**. Either the sprint was mis-scoped or the locked architecture is wrong. Either is worth a pause.
-- Keep `SPRINT_NOTES.md` as a running diary. Useful for blog post in Sprint 9 and for interview storytelling later.
+- Maintain `BACKLOG.md` with anything Claude Code surfaces as "future work."
+- If a sprint exceeds 1.3× budget, stop and reassess. Either the sprint was mis-scoped or the locked architecture is wrong.
+- Keep `SPRINT_NOTES.md` as a running diary. Useful for the DESIGN.md rationale section and for interview storytelling.
+- **Before Sprint 8**: set up the GCP project, enable billing, and confirm `gcloud auth login` works in this terminal session. Sprint 8 needs live GCP to verify the deploy.
+- **Before Sprint 7**: confirm `PINECONE_API_KEY` is set and accessible. The existing Pinecone index can stay — we'll wipe and re-sync during sprint 7-D.

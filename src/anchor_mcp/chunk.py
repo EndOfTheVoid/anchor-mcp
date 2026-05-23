@@ -38,7 +38,9 @@ def _split(text: str, separators: list[str], chunk_size: int, enc: tiktoken.Enco
         if sep == "":
             # Last resort: split at exact token boundaries
             tokens = enc.encode(text)
-            return [enc.decode(tokens[j : j + chunk_size]) for j in range(0, len(tokens), chunk_size)]
+            return [
+                enc.decode(tokens[j : j + chunk_size]) for j in range(0, len(tokens), chunk_size)
+            ]
 
         if sep not in text:
             continue
@@ -96,9 +98,7 @@ def chunk_text(text: str, file: DriveFile, chunk_size: int, overlap: int) -> lis
 
     result: list[Chunk] = []
     for i, chunk_content in enumerate(raw_chunks):
-        chunk_id = hashlib.sha256(
-            f"{file.id}:{i}:{chunk_content}".encode()
-        ).hexdigest()
+        chunk_id = hashlib.sha256(f"{file.id}:{i}:{chunk_content}".encode()).hexdigest()
         result.append(
             Chunk(
                 id=chunk_id,

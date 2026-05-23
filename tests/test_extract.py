@@ -18,6 +18,7 @@ def _file(mime: str, name: str = "test") -> DriveFile:
 
 # ── plain text ────────────────────────────────────────────────────────────────
 
+
 def test_extract_plain_text() -> None:
     result = extract_text(_file("text/plain", "notes.txt"), b"Hello, world!")
     assert result == "Hello, world!"
@@ -45,6 +46,7 @@ def test_extract_utf8_error_raises() -> None:
 
 
 # ── PDF ───────────────────────────────────────────────────────────────────────
+
 
 def _mock_pdf(page_texts: list[str]) -> MagicMock:
     pages = [MagicMock(extract_text=MagicMock(return_value=t)) for t in page_texts]
@@ -88,6 +90,7 @@ def test_extract_scanned_pdf_raises() -> None:
 
 
 # ── unsupported ───────────────────────────────────────────────────────────────
+
 
 def test_extract_unsupported_mime_raises() -> None:
     with pytest.raises(UnsupportedMimeTypeError):

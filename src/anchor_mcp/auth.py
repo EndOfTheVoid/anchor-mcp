@@ -2,7 +2,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from cryptography.fernet import Fernet
 from google.auth.transport.requests import Request
@@ -11,6 +11,9 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 from anchor_mcp.config import get_state_dir
 from anchor_mcp.errors import AuthError
+
+if TYPE_CHECKING:
+    import google.oauth2.service_account
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 _KEY_FILE = ".key"
@@ -58,9 +61,7 @@ def load_credentials(state_dir: Path | None = None) -> Credentials:
 
     token_path = _token_path(state_dir)
     if not token_path.exists():
-        raise AuthError(
-            "No OAuth token found. Run `anchor auth login --credentials <path>`."
-        )
+        raise AuthError("No OAuth token found. Run `anchor auth login --credentials <path>`.")
 
     try:
         fernet = _get_or_create_key(state_dir)
@@ -86,3 +87,23 @@ def is_authenticated(state_dir: Path | None = None) -> bool:
     if state_dir is None:
         state_dir = get_state_dir()
     return _token_path(state_dir).exists()
+
+
+def load_service_account_credentials() -> "google.oauth2.service_account.Credentials":
+    """Load Drive credentials from GOOGLE_SERVICE_ACCOUNT_KEY env var (JSON string)."""
+    import google.oauth2.service_account as _sa
+
+    key_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY")
+    if not key_json:
+        raise AuthError("GOOGLE_SERVICE_ACCOUNT_KEY environment variable is not set")
+    try:
+        key_data: object = json.loads(key_json)
+        creds = _sa.Credentials.from_service_account_info(
+            key_data,  # type: ignore[arg-type]
+            scopes=SCOPES,
+        )
+    except AuthError:
+        raise
+    except Exception as exc:
+        raise AuthError(f"Failed to load service account credentials: {exc}") from exc
+    return creds

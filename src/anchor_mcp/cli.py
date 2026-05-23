@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any
 
@@ -231,8 +232,23 @@ def sync() -> None:
 
 
 @cli.command()
-def serve() -> None:
-    """Start the Anchor MCP server (stdio transport)."""
+@click.option(
+    "--local",
+    "local_mode",
+    is_flag=True,
+    default=False,
+    help="Use stdio transport for local dev (default: streamable-http for Cloud Run).",
+)
+def serve(local_mode: bool) -> None:
+    """Start the Anchor MCP server."""
+    if local_mode:
+        _serve_stdio()
+    else:
+        _serve_http()
+
+
+def _serve_stdio() -> None:
+    """stdio transport: protect stdout from library noise then run."""
     import io
     import sys
     from typing import Any
@@ -240,7 +256,6 @@ def serve() -> None:
     # MCP stdio transport requires stdout to carry only JSON-RPC frames.
     # Any library that prints to stdout corrupts the protocol.
     _real_stdout_buffer = sys.stdout.buffer
-
     _stderr_encoding: str = sys.stderr.encoding or "utf-8"
 
     class _StdoutToStderr(io.TextIOBase):
@@ -264,5 +279,14 @@ def serve() -> None:
     from anchor_mcp.server import mcp, start_background_init
 
     start_background_init()
-
     mcp.run(transport="stdio")
+
+
+def _serve_http() -> None:
+    """StreamableHTTP transport for Cloud Run."""
+    server_url = os.environ.get("SERVER_URL", "http://localhost:8080")
+    from anchor_mcp.server import mcp, setup_http_auth, start_background_init
+
+    setup_http_auth(server_url)
+    start_background_init()
+    mcp.run(transport="streamable-http")

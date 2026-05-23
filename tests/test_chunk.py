@@ -20,6 +20,7 @@ def _enc() -> tiktoken.Encoding:
 
 # ── _count ────────────────────────────────────────────────────────────────────
 
+
 def test_count_empty() -> None:
     assert _count("", _enc()) == 0
 
@@ -29,6 +30,7 @@ def test_count_nonempty() -> None:
 
 
 # ── _split ────────────────────────────────────────────────────────────────────
+
 
 def test_split_short_text_unchanged() -> None:
     enc = _enc()
@@ -57,6 +59,7 @@ def test_split_token_boundary_fallback() -> None:
 
 
 # ── _merge ────────────────────────────────────────────────────────────────────
+
 
 def test_merge_short_pieces_into_one_chunk() -> None:
     enc = _enc()
@@ -87,6 +90,7 @@ def test_merge_overlap_shares_content() -> None:
 
 
 # ── chunk_text ────────────────────────────────────────────────────────────────
+
 
 def test_chunk_text_single_chunk_for_short_text() -> None:
     chunks = chunk_text("Hello, world!", _file(), chunk_size=800, overlap=100)

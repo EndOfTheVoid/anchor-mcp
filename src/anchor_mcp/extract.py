@@ -42,6 +42,5 @@ def _decode_utf8(raw_bytes: bytes, filename: str) -> str:
         return raw_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ExtractError(
-            f"Failed to decode {filename!r} as UTF-8. "
-            "Only UTF-8 encoded files are supported."
+            f"Failed to decode {filename!r} as UTF-8. Only UTF-8 encoded files are supported."
         ) from exc

@@ -26,9 +26,7 @@ def _file_item(
 
 def _make_client(*list_responses: dict[str, object]) -> tuple[DriveClient, MagicMock]:
     mock_service = MagicMock()
-    mock_service.files.return_value.list.return_value.execute.side_effect = list(
-        list_responses
-    )
+    mock_service.files.return_value.list.return_value.execute.side_effect = list(list_responses)
     with patch("anchor_mcp.drive.build", return_value=mock_service):
         client = DriveClient(MagicMock())
     return client, mock_service
@@ -68,9 +66,7 @@ def test_list_files_recursive_follows_subfolders() -> None:
             _file_item("id1", "root_doc.txt", "text/plain"),
         ]
     }
-    sub_response = {
-        "files": [_file_item("id2", "sub_doc.pdf", "application/pdf")]
-    }
+    sub_response = {"files": [_file_item("id2", "sub_doc.pdf", "application/pdf")]}
     client, _ = _make_client(root_response, sub_response)
 
     files = client.list_files("root_folder", recursive=True)
@@ -130,9 +126,7 @@ def test_download_google_doc_uses_export_media() -> None:
 
 def test_download_pdf_uses_get_media() -> None:
     mock_service = MagicMock()
-    mock_service.files.return_value.get_media.return_value.execute.return_value = (
-        b"%PDF-1.4 binary"
-    )
+    mock_service.files.return_value.get_media.return_value.execute.return_value = b"%PDF-1.4 binary"
     with patch("anchor_mcp.drive.build", return_value=mock_service):
         client = DriveClient(MagicMock())
 
