@@ -39,3 +39,10 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Stray secret blob in repo root — never commit
+secret.json
+
+# Internal planning docs — keep out of the public repo
+SPRINT_PLAN.md
+SPRINT_NOTES.md

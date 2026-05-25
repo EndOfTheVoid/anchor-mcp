@@ -1,0 +1,33 @@
+# Controls what `gcloud run deploy --source .` uploads to Cloud Build.
+# Keep: src/, pyproject.toml, README.md, Dockerfile, .dockerignore, cloudbuild.yaml.
+
+.git/
+.gitignore
+
+# Virtualenvs / caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+.pyright/
+.mypy_cache/
+.pytest_cache/
+
+# Secrets / local state — must never leave the machine
+.env
+.env.example
+secret.json
+*_token.json
+credentials.json
+.anchor/
+.claude/
+
+# Not needed in the build
+tests/
+docs/
+*.log
+SPRINT_PLAN.md
+SPRINT_NOTES.md

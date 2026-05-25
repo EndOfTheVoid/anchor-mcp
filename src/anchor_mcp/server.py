@@ -163,7 +163,7 @@ def _clean_expired(store: dict[str, dict[str, Any]]) -> None:
 
 
 def _server_url() -> str:
-    return os.environ.get("SERVER_URL", "http://localhost:8080").rstrip("/")
+    return (os.environ.get("SERVER_URL") or "http://localhost:8080").rstrip("/")
 
 
 # ── Allowlist ─────────────────────────────────────────────────────────────────

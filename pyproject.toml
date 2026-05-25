@@ -25,6 +25,7 @@ dependencies = [
     "tiktoken>=0.7",
     "tenacity>=8.0",
     "PyJWT>=2.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

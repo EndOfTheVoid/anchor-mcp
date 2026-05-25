@@ -1,0 +1,22 @@
+# Virtualenvs / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# VCS
+.git/
+.gitignore
+
+# Secrets and local env (must never enter the build context)
+.env
+.env.example
+secret.json
+*.key.json
+
+# Tests and docs (not needed in the runtime image)
+tests/
+docs/
+*.log

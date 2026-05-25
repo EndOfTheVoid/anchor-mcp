@@ -3,10 +3,13 @@ from pathlib import Path
 from typing import Any
 
 import click
+from dotenv import load_dotenv
 
 from anchor_mcp import secrets
 from anchor_mcp.config import AnchorConfig, get_state_dir, load_config, save_config
 from anchor_mcp.errors import AuthError, ConfigNotFoundError
+
+load_dotenv()
 
 
 @click.group()
@@ -284,7 +287,7 @@ def _serve_stdio() -> None:
 
 def _serve_http() -> None:
     """StreamableHTTP transport for Cloud Run."""
-    server_url = os.environ.get("SERVER_URL", "http://localhost:8080")
+    server_url = os.environ.get("SERVER_URL") or "http://localhost:8080"
     from anchor_mcp.server import mcp, setup_http_auth, start_background_init
 
     setup_http_auth(server_url)
