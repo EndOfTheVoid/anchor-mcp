@@ -24,3 +24,7 @@ class ExtractError(AnchorError):
 
 class UnsupportedMimeTypeError(AnchorError):
     """Raised when a file's MIME type is not supported for extraction."""
+
+
+class VerificationError(AnchorError):
+    """Raised when the faithfulness judge cannot produce a usable verdict."""

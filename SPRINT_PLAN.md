@@ -144,7 +144,7 @@ Delivered: `server.py` (FastMCP, `search`, `get_document`, `list_sources`, `sync
 
 ---
 
-# Sprint 7 — Backend migration: Pinecone inference + hybrid search + GCS  [SONNET] [~25k tokens]
+# Sprint 7 ✅ — Backend migration: Pinecone inference + hybrid search + GCS  [SONNET] [~25k tokens]
 
 **Goal**: replace local BGE-M3 with Pinecone's inference API, add hybrid (dense + sparse BM25) retrieval for better citation accuracy, and move all state files to Cloud Storage. This makes the server fully stateless — a prerequisite for Cloud Run.
 
@@ -224,7 +224,7 @@ Delivered: `server.py` (FastMCP, `search`, `get_document`, `list_sources`, `sync
 
 ---
 
-# Sprint 8 — Cloud deployment: transport + OAuth + Docker + CI/CD  [SONNET] [~28k tokens]
+# Sprint 8 ✅ — Cloud deployment: transport + OAuth + Docker + CI/CD  [SONNET] [~28k tokens]
 
 **Goal**: the full Cloud Run deployment. StreamableHTTP transport, Google-OAuth-based user auth (Claude Desktop does the auth dance — no manual token management), Dockerfile, and a single `cloudbuild.yaml` that builds + deploys on push to main.
 
@@ -401,7 +401,7 @@ gcloud builds triggers create github \
 
 ---
 
-# Sprint 9 — Write tools: `add_note` + `verify_claim`  [OPUS] [~20k tokens]
+# Sprint 9 ✅ — Write tools: `add_note` + `verify_claim`  [OPUS] [~20k tokens]
 
 **Goal**: append-only knowledge capture and server-side faithfulness verification. **Marked Opus** because the judge prompt is the highest-leverage prose in the codebase — a bad prompt produces confident-sounding misclassifications.
 
@@ -501,12 +501,12 @@ Note: These tools now run server-side on Cloud Run. `add_note` is admin-only (sh
 | 4 — Vector backend + embed | ✅ done | Sonnet | ~20k |
 | 5 — Sync engine | ✅ done | Sonnet | ~20k |
 | 6 — MCP read tools | ✅ done | Opus | ~20k |
-| 7 — Pinecone inference + hybrid + GCS | 🔜 next | Sonnet | ~25k |
-| 8 — Cloud deploy + OAuth + Docker + CI | 🔜 | Sonnet | ~28k |
-| 9 — `add_note` + `verify_claim` | 🔜 | **Opus** | ~20k |
-| 10 — Hardening + docs + demo | 🔜 | Sonnet | ~18k |
+| 7 — Pinecone inference + hybrid + GCS | ✅ done | Sonnet | ~25k |
+| 8 — Cloud deploy + OAuth + Docker + CI | ✅ done | Sonnet | ~28k |
+| 9 — `add_note` + `verify_claim` | ✅ done | **Opus** | ~20k |
+| 10 — Hardening + docs + demo | 🔜 next | Sonnet | ~18k |
 
-Remaining: ~91k tokens across 4 sprints.
+Remaining: ~18k tokens across 1 sprint.
 
 ---
 
@@ -516,5 +516,5 @@ Remaining: ~91k tokens across 4 sprints.
 - Maintain `BACKLOG.md` with anything Claude Code surfaces as "future work."
 - If a sprint exceeds 1.3× budget, stop and reassess. Either the sprint was mis-scoped or the locked architecture is wrong.
 - Keep `SPRINT_NOTES.md` as a running diary. Useful for the DESIGN.md rationale section and for interview storytelling.
-- **Before Sprint 8**: set up the GCP project, enable billing, and confirm `gcloud auth login` works in this terminal session. Sprint 8 needs live GCP to verify the deploy.
-- **Before Sprint 7**: confirm `PINECONE_API_KEY` is set and accessible. The existing Pinecone index can stay — we'll wipe and re-sync during sprint 7-D.
+- **Before Sprint 9**: confirm `OPENROUTER_API_KEY` is set in `.env` (already done). Verify Sprint 8 auth flow end-to-end before implementing write tools on top of it.
+- **Before Sprint 10**: run Sprints 9 tools through Claude Desktop manually and record results in `SPRINT_NOTES.md`.

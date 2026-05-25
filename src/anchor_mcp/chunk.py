@@ -18,6 +18,7 @@ class Chunk(BaseModel):
     token_count: int
     modified_time: str
     source_url: str | None
+    source_type: str = "drive"
 
 
 @lru_cache(maxsize=1)
@@ -91,25 +92,54 @@ def _merge(pieces: list[str], chunk_size: int, overlap: int, enc: tiktoken.Encod
     return [c for c in chunks if c.strip()]
 
 
-def chunk_text(text: str, file: DriveFile, chunk_size: int, overlap: int) -> list[Chunk]:
+def chunk_raw(
+    text: str,
+    *,
+    file_id: str,
+    file_name: str,
+    modified_time: str,
+    source_url: str | None,
+    chunk_size: int,
+    overlap: int,
+    source_type: str = "drive",
+) -> list[Chunk]:
+    """Chunk arbitrary text into deterministic Chunks, independent of any Drive file.
+
+    Used both for Drive documents (via chunk_text) and for user notes, which have
+    no DriveFile but still need the same splitter and deterministic IDs.
+    """
     enc = _get_encoder()
     pieces = _split(text, list(_SEPARATORS), chunk_size, enc)
     raw_chunks = _merge(pieces, chunk_size, overlap, enc)
 
     result: list[Chunk] = []
     for i, chunk_content in enumerate(raw_chunks):
-        chunk_id = hashlib.sha256(f"{file.id}:{i}:{chunk_content}".encode()).hexdigest()
+        chunk_id = hashlib.sha256(f"{file_id}:{i}:{chunk_content}".encode()).hexdigest()
         result.append(
             Chunk(
                 id=chunk_id,
                 text=chunk_content,
-                file_id=file.id,
-                file_name=file.name,
+                file_id=file_id,
+                file_name=file_name,
                 chunk_index=i,
                 token_count=_count(chunk_content, enc),
-                modified_time=file.modified_time,
-                source_url=file.web_view_link,
+                modified_time=modified_time,
+                source_url=source_url,
+                source_type=source_type,
             )
         )
 
     return result
+
+
+def chunk_text(text: str, file: DriveFile, chunk_size: int, overlap: int) -> list[Chunk]:
+    return chunk_raw(
+        text,
+        file_id=file.id,
+        file_name=file.name,
+        modified_time=file.modified_time,
+        source_url=file.web_view_link,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        source_type="drive",
+    )

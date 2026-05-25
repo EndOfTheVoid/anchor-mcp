@@ -85,6 +85,58 @@ def test_upsert_includes_metadata() -> None:
     assert meta["text"] == "text for c1"
 
 
+def test_upsert_includes_source_type_default() -> None:
+    backend, index = _make_backend()
+    backend.upsert([_chunk("c1")], [_hybrid()])
+
+    meta = index.upsert.call_args.kwargs["vectors"][0]["metadata"]
+    assert meta["source_type"] == "drive"
+
+
+def test_upsert_preserves_user_note_source_type() -> None:
+    backend, index = _make_backend()
+    chunk = _chunk("c1").model_copy(update={"source_type": "user_note"})
+    backend.upsert([chunk], [_hybrid()])
+
+    meta = index.upsert.call_args.kwargs["vectors"][0]["metadata"]
+    assert meta["source_type"] == "user_note"
+
+
+# ── get_chunks_by_ids ─────────────────────────────────────────────────────────
+
+
+def test_get_chunks_by_ids_empty_is_noop() -> None:
+    backend, index = _make_backend()
+    assert backend.get_chunks_by_ids([]) == []
+    index.fetch.assert_not_called()
+
+
+def test_get_chunks_by_ids_fetches_and_reconstructs() -> None:
+    backend, index = _make_backend()
+    vec = MagicMock()
+    vec.metadata = {
+        "text": "note body",
+        "file_id": "note_1",
+        "file_name": "My Note",
+        "chunk_index": 0,
+        "token_count": 3,
+        "modified_time": "2024-01-01T00:00:00Z",
+        "source_url": "",
+        "source_type": "user_note",
+    }
+    resp = MagicMock()
+    resp.vectors = {"c1": vec}
+    index.fetch.return_value = resp
+
+    chunks = backend.get_chunks_by_ids(["c1"])
+
+    index.fetch.assert_called_once_with(ids=["c1"])
+    assert len(chunks) == 1
+    assert chunks[0].id == "c1"
+    assert chunks[0].file_name == "My Note"
+    assert chunks[0].source_type == "user_note"
+
+
 # ── query ─────────────────────────────────────────────────────────────────────
 
 

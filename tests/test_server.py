@@ -8,7 +8,8 @@ from anchor_mcp.backends.base import QueryResult
 from anchor_mcp.chunk import Chunk
 from anchor_mcp.config import AnchorConfig
 from anchor_mcp.embed import HybridEmbedding, SparseValues
-from anchor_mcp.server import DocumentView, SearchResult, SourceInfo
+from anchor_mcp.judge import VerifyResult
+from anchor_mcp.server import DocumentView, NoteReceipt, SearchResult, SourceInfo
 from anchor_mcp.state_store import LocalStateStore
 from anchor_mcp.sync import FileRegistry, RegistryEntry
 
@@ -235,3 +236,86 @@ def test_list_sources_empty_registry(
     injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
 ) -> None:
     assert srv.list_sources() == []
+
+
+# ── add_note ──────────────────────────────────────────────────────────────────
+
+
+def test_add_note_writes_markdown_and_registry(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
+    tmp_path: Path,
+) -> None:
+    _, _, mock_backend, store = injected
+
+    receipt = srv.add_note(
+        content="The Q3 launch is in March.", title="Launch Date", tags=["planning"]
+    )
+
+    assert isinstance(receipt, NoteReceipt)
+    assert receipt.note_id.startswith("note_")
+    assert receipt.title == "Launch Date"
+    assert receipt.chunk_count >= 1
+
+    notes = list((tmp_path / "cache" / "notes").glob("*.md"))
+    assert len(notes) == 1
+    md = notes[0].read_text(encoding="utf-8")
+    assert "# Launch Date" in md
+    assert "planning" in md
+    assert "The Q3 launch is in March." in md
+
+    registry = FileRegistry.load(store)
+    assert receipt.note_id in registry.files
+    assert registry.files[receipt.note_id].file_name == "Launch Date"
+    assert registry.files[receipt.note_id].chunk_count == receipt.chunk_count
+
+
+def test_add_note_chunks_marked_user_note(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
+) -> None:
+    _, _, mock_backend, _ = injected
+
+    srv.add_note(content="Some note body to remember.", title="My Note")
+
+    chunks = mock_backend.upsert.call_args.args[0]
+    assert chunks
+    assert all(c.source_type == "user_note" for c in chunks)
+    assert all(c.file_name == "My Note" for c in chunks)
+
+
+# ── verify_claim ──────────────────────────────────────────────────────────────
+
+
+def test_verify_claim_invokes_judge_with_backend(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from anchor_mcp import secrets
+
+    config, _, mock_backend, _ = injected
+    monkeypatch.setattr(secrets, "get_openrouter_api_key", lambda: "or-key")
+
+    fake_result = VerifyResult(verdict="supported", rationale="ok", evaluated_chunk_ids=["c1"])
+    fake_judge = MagicMock()
+    fake_judge.verify.return_value = fake_result
+    judge_cls = MagicMock(return_value=fake_judge)
+    monkeypatch.setattr(srv, "OpenRouterJudge", judge_cls)
+
+    result = srv.verify_claim("the claim", ["c1"])
+
+    assert result is fake_result
+    judge_cls.assert_called_once_with("or-key", config.judge_model)
+    fake_judge.verify.assert_called_once_with("the claim", ["c1"], mock_backend)
+
+
+def test_openrouter_gate_true_when_key_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    from anchor_mcp import secrets
+
+    monkeypatch.setattr(secrets, "get_openrouter_api_key", lambda: "or-key")
+    assert srv._openrouter_enabled() is True
+
+
+def test_openrouter_gate_false_when_key_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    from anchor_mcp import secrets
+
+    monkeypatch.setattr(secrets, "get_openrouter_api_key", lambda: None)
+    assert srv._openrouter_enabled() is False

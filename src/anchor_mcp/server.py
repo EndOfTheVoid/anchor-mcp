@@ -1,10 +1,12 @@
 import json
 import logging
 import os
+import re
 import secrets as _secrets
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ from anchor_mcp.auth_middleware import require_role
 from anchor_mcp.backends.base import VectorBackend
 from anchor_mcp.config import AnchorConfig, load_config
 from anchor_mcp.embed import PineconeEmbedder
+from anchor_mcp.judge import OpenRouterJudge, VerifyResult
 from anchor_mcp.state_store import StateStore
 
 mcp = FastMCP(
@@ -215,6 +218,13 @@ class SourceInfo(BaseModel):
     modified_time: str
 
 
+class NoteReceipt(BaseModel):
+    note_id: str
+    title: str
+    chunk_count: int
+    stored_at: str
+
+
 # ── tools ─────────────────────────────────────────────────────────────────────
 
 
@@ -369,6 +379,106 @@ def sync_drive() -> dict[str, object]:
         "skipped": report.skipped,
         "errors": report.errors,
     }
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:50] or "note"
+
+
+def _render_note(title: str, tags: list[str], stored_at: str, content: str) -> str:
+    lines = [f"# {title}", "", f"_stored: {stored_at}_"]
+    if tags:
+        lines.append(f"_tags: {', '.join(tags)}_")
+    lines.extend(["", content, ""])
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    description=(
+        "**This permanently appends a note to the shared knowledge base. Only call this "
+        "when the user explicitly says 'remember this,' 'save this,' 'add a note about,' "
+        "or similar. Admin access required.** The note is immediately searchable by all users."
+    )
+)
+@require_role("admin")
+def add_note(content: str, title: str, tags: list[str] | None = None) -> NoteReceipt:
+    from anchor_mcp.chunk import chunk_raw
+    from anchor_mcp.sync import FileRegistry, RegistryEntry
+
+    config, embedder, backend = _ensure_initialized()
+    assert _state_store is not None
+    tag_list = tags or []
+    logger.info("add_note title=%r tags=%r", title, tag_list)
+
+    now = datetime.now(UTC)
+    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+    stored_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    slug = _slugify(title)
+    note_id = f"note_{timestamp}_{slug}"
+
+    body = _render_note(title, tag_list, stored_at, content)
+    _state_store.write(f"notes/{timestamp}_{slug}.md", body.encode())
+
+    chunks = chunk_raw(
+        content,
+        file_id=note_id,
+        file_name=title,
+        modified_time=stored_at,
+        source_url=None,
+        chunk_size=config.chunk_size,
+        overlap=config.chunk_overlap,
+        source_type="user_note",
+    )
+    embeddings = embedder.embed_chunks(chunks)
+    backend.upsert(chunks, embeddings)
+
+    registry = FileRegistry.load(_state_store)
+    registry.files[note_id] = RegistryEntry(
+        file_name=title,
+        chunk_count=len(chunks),
+        modified_time=stored_at,
+    )
+    registry.save(_state_store)
+
+    logger.info("add_note stored note_id=%r chunks=%d", note_id, len(chunks))
+    return NoteReceipt(
+        note_id=note_id,
+        title=title,
+        chunk_count=len(chunks),
+        stored_at=stored_at,
+    )
+
+
+_VERIFY_CLAIM_DESCRIPTION = (
+    "Verify whether a factual claim is supported by specific evidence chunks from the "
+    "knowledge base. Call this after making a substantive claim based on `search` results. "
+    "Pass the claim and the `chunk_id` values from the search results you used. "
+    "If verdict is not 'supported', you MUST tell the user your claim could not be fully "
+    "verified against their documents."
+)
+
+
+def verify_claim(claim: str, chunk_ids: list[str]) -> VerifyResult:
+    from anchor_mcp import secrets
+
+    config, _, backend = _ensure_initialized()
+    api_key = secrets.get_openrouter_api_key()
+    assert api_key is not None  # registration is gated on this being set
+    logger.info("verify_claim claim=%r chunk_ids=%r", claim, chunk_ids)
+    judge = OpenRouterJudge(api_key, config.judge_model)
+    return judge.verify(claim, chunk_ids, backend)
+
+
+def _openrouter_enabled() -> bool:
+    from anchor_mcp import secrets
+
+    return secrets.get_openrouter_api_key() is not None
+
+
+# verify_claim is only exposed as an MCP tool when an OpenRouter key is configured.
+if _openrouter_enabled():
+    mcp.tool(description=_VERIFY_CLAIM_DESCRIPTION)(verify_claim)
 
 
 # ── custom HTTP routes ────────────────────────────────────────────────────────

@@ -12,6 +12,20 @@ _DEFAULT_CLOUD = "aws"
 _DEFAULT_REGION = "us-east-1"
 
 
+def _chunk_from_meta(chunk_id: str, meta: dict[str, Any]) -> Chunk:
+    return Chunk(
+        id=chunk_id,
+        text=str(meta.get("text", "")),
+        file_id=str(meta.get("file_id", "")),
+        file_name=str(meta.get("file_name", "")),
+        chunk_index=int(meta.get("chunk_index", 0)),
+        token_count=int(meta.get("token_count", 0)),
+        modified_time=str(meta.get("modified_time", "")),
+        source_url=str(meta.get("source_url")) or None,
+        source_type=str(meta.get("source_type", "drive")),
+    )
+
+
 class PineconeBackend:
     def __init__(self, pc_client: Any, index_name: str = "anchor") -> None:
         existing = {idx.name for idx in pc_client.list_indexes()}
@@ -62,6 +76,7 @@ class PineconeBackend:
                     "token_count": c.token_count,
                     "modified_time": c.modified_time,
                     "source_url": c.source_url or "",
+                    "source_type": c.source_type,
                     "text": c.text,
                 },
             }
@@ -97,17 +112,9 @@ class PineconeBackend:
         results: list[QueryResult] = []
         for match in response.matches:
             meta: dict[str, Any] = match.metadata or {}
-            chunk = Chunk(
-                id=match.id,
-                text=str(meta.get("text", "")),
-                file_id=str(meta.get("file_id", "")),
-                file_name=str(meta.get("file_name", "")),
-                chunk_index=int(meta.get("chunk_index", 0)),
-                token_count=int(meta.get("token_count", 0)),
-                modified_time=str(meta.get("modified_time", "")),
-                source_url=str(meta.get("source_url")) or None,
+            results.append(
+                QueryResult(chunk=_chunk_from_meta(match.id, meta), score=float(match.score))
             )
-            results.append(QueryResult(chunk=chunk, score=float(match.score)))
         return results
 
     def delete(self, chunk_ids: list[str]) -> None:
@@ -133,17 +140,17 @@ class PineconeBackend:
         chunks: list[Chunk] = []
         for match in response.matches:
             meta: dict[str, Any] = match.metadata or {}
-            chunks.append(
-                Chunk(
-                    id=match.id,
-                    text=str(meta.get("text", "")),
-                    file_id=str(meta.get("file_id", "")),
-                    file_name=str(meta.get("file_name", "")),
-                    chunk_index=int(meta.get("chunk_index", 0)),
-                    token_count=int(meta.get("token_count", 0)),
-                    modified_time=str(meta.get("modified_time", "")),
-                    source_url=str(meta.get("source_url")) or None,
-                )
-            )
+            chunks.append(_chunk_from_meta(match.id, meta))
         chunks.sort(key=lambda c: c.chunk_index)
+        return chunks
+
+    def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[Chunk]:
+        if not chunk_ids:
+            return []
+        response: Any = self._index.fetch(ids=chunk_ids)
+        vectors: dict[str, Any] = getattr(response, "vectors", None) or {}
+        chunks: list[Chunk] = []
+        for cid, vec in vectors.items():
+            meta: dict[str, Any] = getattr(vec, "metadata", None) or {}
+            chunks.append(_chunk_from_meta(str(cid), meta))
         return chunks
