@@ -31,11 +31,7 @@ steps:
     entrypoint: bash
     args:
       - -c
-      - |
-        URL=$(gcloud run services describe anchor-mcp \
-          --region=us-central1 \
-          --format='value(status.url)')
-        curl -sf "$URL/health"
+      - curl -sf "${_SERVER_URL}/health"
 
 images:
   - gcr.io/$PROJECT_ID/anchor-mcp:$SHORT_SHA
