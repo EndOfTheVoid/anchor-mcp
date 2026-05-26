@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock
 
+from pinecone.models.inference.embed import DenseEmbedding, SparseEmbedding
+
 from anchor_mcp.chunk import Chunk
 from anchor_mcp.embed import HybridEmbedding, PineconeEmbedder, SparseValues
 
@@ -17,25 +19,14 @@ def _chunk(i: int) -> Chunk:
     )
 
 
-def _make_dense_response(n: int, dim: int = 1024) -> list[MagicMock]:
-    results = []
-    for _ in range(n):
-        m = MagicMock()
-        m.values = [0.1] * dim
-        results.append(m)
-    return results
+# Use Pinecone's real response classes so the test fails if the API shape drifts
+# (a MagicMock previously masked a sparse_indices/sparse_values attribute bug).
+def _make_dense_response(n: int, dim: int = 1024) -> list[DenseEmbedding]:
+    return [DenseEmbedding(values=[0.1] * dim) for _ in range(n)]
 
 
-def _make_sparse_response(n: int) -> list[MagicMock]:
-    results = []
-    for _ in range(n):
-        m = MagicMock()
-        sv = MagicMock()
-        sv.indices = [1, 2]
-        sv.values = [0.5, 0.3]
-        m.sparse_values = sv
-        results.append(m)
-    return results
+def _make_sparse_response(n: int) -> list[SparseEmbedding]:
+    return [SparseEmbedding(sparse_values=[0.5, 0.3], sparse_indices=[1, 2]) for _ in range(n)]
 
 
 def _make_pc(n_chunks: int) -> MagicMock:

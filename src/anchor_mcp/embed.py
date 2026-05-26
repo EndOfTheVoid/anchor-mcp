@@ -58,8 +58,8 @@ class PineconeEmbedder:
             HybridEmbedding(
                 dense=list(d.values),
                 sparse=SparseValues(
-                    indices=list(s.sparse_values.indices),
-                    values=list(s.sparse_values.values),
+                    indices=list(s.sparse_indices),
+                    values=list(s.sparse_values),
                 ),
             )
             for d, s in zip(dense_response, sparse_response, strict=True)
