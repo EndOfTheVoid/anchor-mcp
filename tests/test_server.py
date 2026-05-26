@@ -153,6 +153,48 @@ def test_search_empty_returns_empty_list(
     assert srv.search("query") == []
 
 
+def test_search_caps_top_k(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
+) -> None:
+    _, _, mock_backend, _ = injected
+    mock_backend.query.return_value = []
+
+    srv.search("query", top_k=100)
+
+    assert mock_backend.query.call_args.kwargs["top_k"] == srv._MAX_TOP_K
+
+
+def test_search_top_k_floored_at_one(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
+) -> None:
+    _, _, mock_backend, _ = injected
+    mock_backend.query.return_value = []
+
+    srv.search("query", top_k=0)
+
+    assert mock_backend.query.call_args.kwargs["top_k"] == 1
+
+
+def test_search_rejects_empty_query(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
+) -> None:
+    _, mock_embedder, mock_backend, _ = injected
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        srv.search("")
+
+    # Validation must happen before any backend/embedder work.
+    mock_embedder.embed_query.assert_not_called()
+    mock_backend.query.assert_not_called()
+
+
+def test_search_rejects_whitespace_query(
+    injected: tuple[AnchorConfig, MagicMock, MagicMock, LocalStateStore],
+) -> None:
+    with pytest.raises(ValueError, match="cannot be empty"):
+        srv.search("   \t\n  ")
+
+
 # ── get_document ──────────────────────────────────────────────────────────────
 
 

@@ -126,13 +126,16 @@ class PineconeBackend:
         return int(stats.total_vector_count)
 
     def get_chunks_by_file(self, file_id: str) -> list[Chunk]:
-        # Neutral dense vector + empty sparse to satisfy Pinecone's query requirement.
-        # The filter on file_id drives the result, not vector similarity.
+        # Metadata-filter retrieval: the file_id filter drives the result, not vector
+        # similarity. Pinecone still requires a non-empty sparse vector on a dotproduct
+        # index (an empty one fails with "Sparse vector must contain at least one value"),
+        # so send a single sentinel term. Scores are irrelevant here — we re-sort by
+        # chunk_index below and top_k is large enough to return every chunk for the file.
         neutral_dense = [1.0 / math.sqrt(EMBEDDING_DIM)] * EMBEDDING_DIM
-        neutral_sparse: dict[str, Any] = {"indices": [], "values": []}
+        sentinel_sparse: dict[str, Any] = {"indices": [0], "values": [1.0]}
         response: Any = self._index.query(
             vector=neutral_dense,
-            sparse_vector=neutral_sparse,
+            sparse_vector=sentinel_sparse,
             top_k=10_000,
             filter={"file_id": {"$eq": file_id}},
             include_metadata=True,

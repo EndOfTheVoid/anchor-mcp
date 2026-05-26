@@ -233,6 +233,19 @@ def test_get_chunks_by_file_passes_file_id_filter() -> None:
     assert kwargs["top_k"] == 10_000
 
 
+def test_get_chunks_by_file_sends_nonempty_sparse_vector() -> None:
+    # An empty sparse vector makes Pinecone reject the query with
+    # "Sparse vector must contain at least one value", which leaked as a cryptic
+    # error from get_document. The query must carry a valid, non-empty sparse term.
+    backend, index = _make_backend()
+    index.query.return_value = _empty_query_response()
+    backend.get_chunks_by_file("f1")
+
+    sv = index.query.call_args.kwargs["sparse_vector"]
+    assert len(sv["indices"]) >= 1
+    assert len(sv["values"]) == len(sv["indices"])
+
+
 # ── factory ───────────────────────────────────────────────────────────────────
 
 

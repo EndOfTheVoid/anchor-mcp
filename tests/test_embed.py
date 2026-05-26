@@ -1,9 +1,17 @@
 from unittest.mock import MagicMock
 
+import pytest
+from pinecone.exceptions import PineconeApiException
 from pinecone.models.inference.embed import DenseEmbedding, SparseEmbedding
 
 from anchor_mcp.chunk import Chunk
-from anchor_mcp.embed import HybridEmbedding, PineconeEmbedder, SparseValues
+from anchor_mcp.embed import (
+    HybridEmbedding,
+    PineconeEmbedder,
+    SparseValues,
+    _is_rate_limit_or_transient,
+)
+from anchor_mcp.errors import BackendError
 
 
 def _chunk(i: int) -> Chunk:
@@ -98,3 +106,45 @@ def test_embed_chunks_batches_at_96() -> None:
 
     assert len(results) == 100
     assert pc.inference.embed.call_count == 4
+
+
+# ── rate-limit retry ────────────────────────────────────────────────────────────
+
+
+def test_is_rate_limit_or_transient_classifies_status_codes() -> None:
+    assert _is_rate_limit_or_transient(PineconeApiException("rate limited", 429)) is True
+    assert _is_rate_limit_or_transient(PineconeApiException("unavailable", 503)) is True
+    assert _is_rate_limit_or_transient(PineconeApiException("bad request", 400)) is False
+    assert _is_rate_limit_or_transient(ValueError("no status_code")) is False
+
+
+def test_embed_retries_on_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Don't actually sleep between retries.
+    monkeypatch.setattr(PineconeEmbedder._embed_call.retry, "sleep", lambda _: None)
+
+    pc = MagicMock()
+    pc.inference.embed.side_effect = [
+        PineconeApiException("rate limited", 429),  # dense attempt 1 → retry
+        _make_dense_response(1),  # dense attempt 2 → ok
+        _make_sparse_response(1),  # sparse → ok
+    ]
+    embedder = PineconeEmbedder(pc, "dense-model", "sparse-model")
+
+    result = embedder.embed_query("test query")
+
+    assert isinstance(result, HybridEmbedding)
+    assert pc.inference.embed.call_count == 3
+
+
+def test_embed_does_not_retry_client_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(PineconeEmbedder._embed_call.retry, "sleep", lambda _: None)
+
+    pc = MagicMock()
+    pc.inference.embed.side_effect = PineconeApiException("bad request", 400)
+    embedder = PineconeEmbedder(pc, "dense-model", "sparse-model")
+
+    with pytest.raises(BackendError):
+        embedder.embed_query("test query")
+
+    # 400 is a caller error — no retry, and it surfaces as a clean BackendError.
+    assert pc.inference.embed.call_count == 1

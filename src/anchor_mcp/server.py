@@ -257,15 +257,20 @@ class NoteReceipt(BaseModel):
 
 # ── tools ─────────────────────────────────────────────────────────────────────
 
+_MAX_TOP_K = 20
+
 
 @mcp.tool(
     description=(
         "Search the user's Google Drive knowledge base by hybrid semantic + keyword similarity. "
-        "Returns up to top_k chunks of text with full source metadata. "
+        f"Returns up to top_k chunks of text with full source metadata (top_k is capped at "
+        f"{_MAX_TOP_K}). "
         "alpha controls the blend: 0.0 = keyword-only, 1.0 = semantic-only, default 0.7. "
         "You MUST cite every result you use with the format [file_name, chunk N](source_url). "
-        "If results have low relevance scores (below 0.5), tell the user the answer "
-        "may not be in their indexed documents."
+        "Relevance scores are only comparable within the same alpha; at the default blend a score "
+        "below 0.5 means the answer may not be in the indexed documents — say so to the user. "
+        "(Pure keyword mode, alpha=0.0, produces unbounded dot-product scores on a different "
+        "scale, so the 0.5 guidance does not apply there.)"
     )
 )
 def search(
@@ -274,19 +279,23 @@ def search(
     alpha: float | None = None,
     file_name_filter: str | None = None,
 ) -> list[SearchResult]:
+    if not query or not query.strip():
+        raise ValueError("Search query cannot be empty.")
+
     config, embedder, backend = _ensure_initialized()
     effective_alpha = alpha if alpha is not None else config.search_alpha
+    effective_top_k = max(1, min(top_k, _MAX_TOP_K))
     logger.info(
         "search query=%r top_k=%d alpha=%r filter=%r",
         query,
-        top_k,
+        effective_top_k,
         effective_alpha,
         file_name_filter,
     )
 
     embedding = embedder.embed_query(query)
     results = backend.query(
-        embedding, top_k=top_k, alpha=effective_alpha, file_name_filter=file_name_filter
+        embedding, top_k=effective_top_k, alpha=effective_alpha, file_name_filter=file_name_filter
     )
 
     return [
