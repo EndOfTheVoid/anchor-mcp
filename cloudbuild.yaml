@@ -47,4 +47,4 @@ substitutions:
   _SERVER_URL: "https://anchor-mcp-778459062218.us-central1.run.app"
   # Model that verify_claim sends to OpenRouter. A standard (non-":free") Mistral
   # slug routes through your own Mistral key (BYOK) instead of OpenRouter credits.
-  _JUDGE_MODEL: "mistralai/mistral-small-3.1-24b-instruct"
+  _JUDGE_MODEL: "mistralai/mistral-small-3.2-24b-instruct"

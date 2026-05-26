@@ -120,6 +120,27 @@ class OpenRouterJudge:
 
         try:
             data: Any = response.json()
-            return str(data["choices"][0]["message"]["content"])
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
-            raise VerificationError(f"Unexpected OpenRouter response shape: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise VerificationError(f"OpenRouter response was not JSON: {exc}") from exc
+
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            raise VerificationError(f"OpenRouter returned no choices: {data}")
+        choice = choices[0]
+
+        # OpenRouter returns HTTP 200 even when the upstream provider fails mid-stream,
+        # signalling it via an `error` object on the choice (with truncated/empty content).
+        # Surface that as the real cause instead of a misleading malformed-JSON error.
+        provider_error = choice.get("error")
+        if provider_error:
+            code = provider_error.get("code")
+            message = provider_error.get("message", "unknown error")
+            raise VerificationError(
+                f"OpenRouter upstream provider error {code}: {message}. "
+                f"Consider switching ANCHOR_JUDGE_MODEL to a different model."
+            )
+
+        content = (choice.get("message") or {}).get("content")
+        if not content:
+            raise VerificationError("OpenRouter returned an empty completion.")
+        return str(content)

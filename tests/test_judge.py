@@ -36,6 +36,25 @@ def _resp(content: str, status: int = 200) -> MagicMock:
     return resp
 
 
+def _provider_error_resp(code: int = 500, message: str = "Internal Server Error") -> MagicMock:
+    """OpenRouter returns HTTP 200 with an embedded provider error and truncated content."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = ""
+    resp.json.return_value = {
+        "choices": [{"error": {"code": code, "message": message}, "message": {"content": ""}}]
+    }
+    return resp
+
+
+def _empty_content_resp() -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = ""
+    resp.json.return_value = {"choices": [{"message": {"content": ""}}]}
+    return resp
+
+
 def _verdict_json(verdict: str, ids: list[str] | None = None) -> str:
     chunk_ids = ids if ids is not None else ["c1"]
     id_list = ", ".join(f'"{i}"' for i in chunk_ids)
@@ -114,6 +133,25 @@ def test_verify_raises_on_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("anchor_mcp.judge.httpx.post", lambda *a, **k: _resp("boom", status=500))
     judge = OpenRouterJudge("key", "model")
     with pytest.raises(VerificationError, match="status 500"):
+        judge.verify("claim", ["c1"], _backend([_chunk()]))
+
+
+def test_verify_raises_on_embedded_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # HTTP 200 but the upstream provider failed (the real-world verify_claim bug):
+    # must report the provider error, not a misleading "malformed JSON".
+    post = MagicMock(side_effect=lambda *a, **k: _provider_error_resp(500, "Internal Server Error"))
+    monkeypatch.setattr("anchor_mcp.judge.httpx.post", post)
+    judge = OpenRouterJudge("key", "model")
+    with pytest.raises(VerificationError, match="provider error 500"):
+        judge.verify("claim", ["c1"], _backend([_chunk()]))
+    # No point retrying a provider error with a "fix your JSON" prompt — fail fast.
+    assert post.call_count == 1
+
+
+def test_verify_raises_on_empty_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("anchor_mcp.judge.httpx.post", lambda *a, **k: _empty_content_resp())
+    judge = OpenRouterJudge("key", "model")
+    with pytest.raises(VerificationError, match="empty completion"):
         judge.verify("claim", ["c1"], _backend([_chunk()]))
 
 
