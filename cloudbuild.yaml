@@ -22,7 +22,7 @@ steps:
       - --service-account=anchor-sa@$PROJECT_ID.iam.gserviceaccount.com
       - --allow-unauthenticated
       - --set-secrets=PINECONE_API_KEY=PINECONE_API_KEY:latest,OPENROUTER_API_KEY=OPENROUTER_API_KEY:latest,GOOGLE_SERVICE_ACCOUNT_KEY=GOOGLE_SERVICE_ACCOUNT_KEY:latest,GOOGLE_OAUTH_CLIENT_ID=GOOGLE_OAUTH_CLIENT_ID:latest,GOOGLE_OAUTH_CLIENT_SECRET=GOOGLE_OAUTH_CLIENT_SECRET:latest,JWT_SECRET=JWT_SECRET:latest
-      - --set-env-vars=GCS_BUCKET=anchor-$PROJECT_ID-state,ANCHOR_DRIVE_FOLDER_ID=${_DRIVE_FOLDER_ID},SERVER_URL=${_SERVER_URL}
+      - --set-env-vars=GCS_BUCKET=anchor-$PROJECT_ID-state,ANCHOR_DRIVE_FOLDER_ID=${_DRIVE_FOLDER_ID},SERVER_URL=${_SERVER_URL},ANCHOR_JUDGE_MODEL=${_JUDGE_MODEL}
       - --port=8080
       - --memory=1Gi
       - --timeout=900
@@ -45,3 +45,6 @@ substitutions:
   # Deploy targets for this project. Override per-trigger if you fork the deploy.
   _DRIVE_FOLDER_ID: "1cxUYzyu6ovglUAoZF9yvxyS8NWphNFTa"
   _SERVER_URL: "https://anchor-mcp-778459062218.us-central1.run.app"
+  # Model that verify_claim sends to OpenRouter. A standard (non-":free") Mistral
+  # slug routes through your own Mistral key (BYOK) instead of OpenRouter credits.
+  _JUDGE_MODEL: "mistralai/mistral-small-3.1-24b-instruct"
