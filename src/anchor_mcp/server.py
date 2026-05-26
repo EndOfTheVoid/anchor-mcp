@@ -166,6 +166,36 @@ def _server_url() -> str:
     return (os.environ.get("SERVER_URL") or "http://localhost:8080").rstrip("/")
 
 
+def _protected_resource_doc(resource: str) -> dict[str, Any]:
+    """RFC 9728 OAuth Protected Resource Metadata — tells MCP clients which
+    authorization server protects this resource."""
+    return {
+        "resource": resource,
+        "authorization_servers": [_server_url()],
+        "bearer_methods_supported": ["header"],
+    }
+
+
+def _dcr_response(body: dict[str, Any]) -> dict[str, Any]:
+    """RFC 7591 Dynamic Client Registration response. The OAuth endpoints don't
+    validate client_id against a registry (PKCE + the email allowlist are the real
+    guards), so registration just mints an id and echoes the client's metadata."""
+    now = int(time.time())
+    resp: dict[str, Any] = {
+        "client_id": _secrets.token_urlsafe(24),
+        "client_id_issued_at": now,
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": body.get("grant_types") or ["authorization_code"],
+        "response_types": body.get("response_types") or ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+    if body.get("client_name"):
+        resp["client_name"] = body["client_name"]
+    if body.get("scope"):
+        resp["scope"] = body["scope"]
+    return resp
+
+
 # ── Allowlist ─────────────────────────────────────────────────────────────────
 
 
@@ -497,10 +527,32 @@ async def oauth_discovery(request: Request) -> Response:
             "issuer": base,
             "authorization_endpoint": f"{base}/oauth/authorize",
             "token_endpoint": f"{base}/oauth/token",
+            "registration_endpoint": f"{base}/oauth/register",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
         }
     )
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+async def oauth_protected_resource(request: Request) -> Response:
+    return JSONResponse(_protected_resource_doc(_server_url()))
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource/mcp", methods=["GET"])
+async def oauth_protected_resource_mcp(request: Request) -> Response:
+    return JSONResponse(_protected_resource_doc(f"{_server_url()}/mcp"))
+
+
+@mcp.custom_route("/oauth/register", methods=["POST"])
+async def oauth_register(request: Request) -> Response:
+    try:
+        body: dict[str, Any] = await request.json()
+    except Exception:
+        body = {}
+    return JSONResponse(_dcr_response(body), status_code=201)
 
 
 @mcp.custom_route("/oauth/authorize", methods=["GET"])

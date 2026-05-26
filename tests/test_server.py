@@ -319,3 +319,35 @@ def test_openrouter_gate_false_when_key_absent(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(secrets, "get_openrouter_api_key", lambda: None)
     assert srv._openrouter_enabled() is False
+
+
+# ── OAuth discovery: protected-resource metadata + dynamic client registration ──
+
+
+def test_protected_resource_doc_points_to_auth_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SERVER_URL", "https://anchor.example.com")
+    doc = srv._protected_resource_doc("https://anchor.example.com/mcp")
+    assert doc["resource"] == "https://anchor.example.com/mcp"
+    assert doc["authorization_servers"] == ["https://anchor.example.com"]
+    assert doc["bearer_methods_supported"] == ["header"]
+
+
+def test_dcr_response_mints_client_id_and_echoes_metadata() -> None:
+    body = {
+        "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+        "client_name": "Claude",
+    }
+    resp = srv._dcr_response(body)
+    assert resp["client_id"]
+    assert resp["redirect_uris"] == ["https://claude.ai/api/mcp/auth_callback"]
+    assert resp["token_endpoint_auth_method"] == "none"
+    assert resp["client_name"] == "Claude"
+
+
+def test_dcr_response_defaults_when_minimal() -> None:
+    resp = srv._dcr_response({})
+    assert resp["client_id"]
+    assert resp["redirect_uris"] == []
+    assert resp["grant_types"] == ["authorization_code"]
+    assert resp["response_types"] == ["code"]
+    assert "client_name" not in resp
